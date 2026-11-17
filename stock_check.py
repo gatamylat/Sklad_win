@@ -18,9 +18,9 @@ from openpyxl.styles import Alignment, Font, PatternFill
 
 MODEL = 'deepseek-flash'
 MANUAL = 'Проверить вручную'
-ORDER_CODE = re.compile(r'^\d{2}[-_]\d{2}[-_]\d{2}[-_]\d{2}(?:\s|$)')
 ARTICLE_LETTERS = str.maketrans('АВЕКМНОРСТХУ', 'ABEKMHOPCTXY')
 BLUM_PACK = re.compile(r'^(\d{2}[A-Z][A-Z0-9.]+)\s+(?:MB\s+)?V\d+(?=\s|$)')
+BLUM_HINGE_COLOR = re.compile(r'^(7\d[A-Z]\d{4})[.\s-]+(ONS|NI|OG|SEIW|TERS)$')
 UNITS = {
     'шт': 'шт', 'штука': 'шт', 'штук': 'шт', 'компл': 'компл', 'комплект': 'компл',
     'комплекты': 'компл', 'к-т': 'компл', 'мп': 'м', 'погм': 'м', 'м': 'м',
@@ -38,7 +38,8 @@ def name_key(value):
 
 def article_key(value):
     text = name_key(value).upper().translate(ARTICLE_LETTERS)
-    key = re.sub(r'\s+', '', BLUM_PACK.sub(r'\1', text))
+    text = BLUM_PACK.sub(r'\1', text)
+    key = re.sub(r'\s+', '', BLUM_HINGE_COLOR.sub(r'\1\2', text))
     return key if re.fullmatch(r'[A-ZА-Я0-9][A-ZА-Я0-9()./\-]*', key) else ''
 
 
@@ -111,15 +112,11 @@ def request_rows(sheet, header_row, columns):
     for row_no, cells in enumerate(sheet.iter_rows(min_row=header_row + 1, max_col=last_column), header_row + 1):
         values = {field: cell_value(cells[i]) if i is not None else None for field, i in columns.items()}
         article, name, unit, qty = (clean(values[key]) for key in ('art', 'name', 'unit', 'qty'))
-        if not (article or name or qty):
-            continue
-        if not unit and not qty and row_no == header_row + 1 and ORDER_CODE.match(article):
-            continue
-        if not article and not unit and not qty and re.match(r'^итого(?:\s|:|$)', name_key(name)):
+        if not qty or not (article or name):
             continue
         result.append({'row': row_no, 'article': article, 'name': name, 'unit': unit, 'need': number(qty)})
     if not result:
-        raise ValueError('В заявке нет строк для проверки.')
+        raise ValueError('В заявке нет позиций с заполненным количеством.')
     return result
 
 
@@ -139,7 +136,7 @@ def purchase_aliases(workbook):
     return aliases
 
 
-def read_purchases(path):
+def read_purchases(path, articles_by_name=None):
     workbook = load_workbook(path, read_only=True, data_only=True)
     try:
         if 'Склад' not in workbook:
@@ -151,6 +148,10 @@ def read_purchases(path):
         ]:
             raise ValueError('В «Закупках» изменились колонки листа «Склад» (B, J, K).')
         aliases = purchase_aliases(workbook)
+        if articles_by_name is not None:
+            for title, (articles, _) in aliases.items():
+                if articles and len({article_key(article) for article in articles}) == 1:
+                    articles_by_name[title] = sorted(articles, key=lambda article: (len(article), article))[0]
         items = []
         for i, row in enumerate(sheet.iter_rows(min_row=3, max_col=11, values_only=True), 3):
             title = clean(row[1])
@@ -221,9 +222,13 @@ class Catalog:
     def exact(self, row, purchases=False):
         key = article_key(row['article'])
         matches = self.by_article.get(key, [])
-        if matches or not purchases or not key or not row['name']:
+        if matches or not row['name']:
             return matches
-        return [item for item in self.by_name.get(name_key(row['name']), []) if not item.articles]
+        same_name = self.by_name.get(name_key(row['name']), [])
+        if key:
+            return [item for item in same_name if not item.articles] if purchases else []
+        distinct = {article_key(article) for item in same_name for article in item.articles}
+        return same_name if not row['article'] and len(distinct) <= 1 else []
 
     def likely(self, row, exact):
         tokens = words(f'{row["name"]} {row["article"]}')
@@ -244,21 +249,45 @@ def evidence(item):
             'quantity': item.qty, 'place': item.place, 'checked': item.checked, 'reserve': item.reserve}
 
 
-def compare(request, purchases, registry):
+def availability(purchases, register):
+    active = [item for item in register if item.qty is None or item.qty > 0]
+    counted = [item for item in register if item.qty is not None and item.qty >= 0]
+    units = {item.unit for item in register}
+    quantity = sum((item.qty for item in counted), Decimal(0)) if counted and len(units) == 1 else None
+    purchase = purchases[0] if len(purchases) == 1 else None
+    if purchase and len({article_key(article) for article in purchase.articles}) > 1:
+        purchase = None
+    free = purchase.qty if purchase else None
+    return {
+        'stock_found': bool(active or (free is not None and free > 0)),
+        'stock_qty': quantity, 'stock_unit': next(iter(units)) if len(units) == 1 else '',
+        'stock_uncounted': any(item.qty is None for item in active),
+        'stock_places': list(dict.fromkeys(item.place for item in active if item.place)),
+        'free_qty': free, 'free_unit': purchase.unit if purchase else '',
+    }
+
+
+def compare(request, purchases, registry, articles_by_name=None):
     purchase_catalog, register_catalog = Catalog(purchases), Catalog(registry)
     purchase_left = {item.id: item.qty for item in purchases}
     register_left = {item.id: item.qty for item in registry}
     results, pending = [], []
     for row in request:
-        buy = purchase_catalog.exact(row, purchases=True)
-        stock = register_catalog.exact(row)
+        identified = (articles_by_name or {}).get(name_key(row['name']), '') if not row['article'] else ''
+        lookup = {**row, 'article': identified} if identified else row
+        buy = purchase_catalog.exact(lookup, purchases=True)
+        stock = register_catalog.exact(lookup)
         result = {**row, 'take': None, 'buy': None, 'status': MANUAL, 'locations': [],
-                  'purchases': [evidence(p) for p in buy], 'registry': [evidence(p) for p in stock]}
+                  'purchases': [evidence(p) for p in buy], 'registry': [evidence(p) for p in stock],
+                  'matched_article': identified, **availability(buy, stock)}
         reason = compare_row(result, buy, stock, purchase_left, register_left)
         if reason:
             result['reason'] = reason
+            if result['stock_found']:
+                result['status'] = ('Есть, не пересчитано' if result['stock_uncounted'] else
+                                    'Есть в реестре' if stock and result['stock_qty'] != 0 else 'Есть по «Закупкам»')
             if result['need'] is not None and result['need'] > 0 and (not buy or not stock):
-                candidates = [*purchase_catalog.likely(row, buy), *register_catalog.likely(row, stock)]
+                candidates = [*purchase_catalog.likely(lookup, buy), *register_catalog.likely(lookup, stock)]
                 if candidates:
                     pending.append((result, candidates))
                 elif not buy and not stock:
@@ -273,8 +302,13 @@ def compare_row(result, purchases, register, purchase_left, register_left):
         return 'В строке заявки нет положительного количества.'
     if not unit:
         return 'В заявке не указана единица измерения.'
-    if not purchases or not register:
-        return 'Нет точного совпадения в обоих источниках.'
+    if result['stock_uncounted']:
+        return 'Есть запись в реестре. Складское количество не указано. Перед выдачей пересчитайте на полке.'
+    if not purchases:
+        return ('Количество по реестру показано. Свободный остаток в листе «Склад» не найден.' if register else
+                'Точного совпадения в «Закупках» и реестре пока нет.')
+    if not register:
+        return 'Свободный остаток показан по «Закупкам». В реестре эта позиция и адрес полки не найдены.'
     if len(purchases) != 1:
         return 'В «Закупках» несколько строк для позиции. Требуется уточнить строку остатка.'
     purchase = purchases[0]
@@ -310,7 +344,7 @@ def compare_row(result, purchases, register, purchase_left, register_left):
 def deepseek_request(key, batch):
     tasks = []
     for row, candidates in batch:
-        tasks.append({'row': row['row'], 'article': row['article'][:160], 'name': row['name'][:240],
+        tasks.append({'row': row['row'], 'article': (row['article'] or row.get('matched_article', ''))[:160], 'name': row['name'][:240],
                       'unit': row['unit'][:30], 'candidates': [
                           {'id': i, 'source': item.source, 'name': item.name[:240],
                            'articles': [art[:160] for art in item.articles[:8]], 'unit': item.unit[:30]}
@@ -397,11 +431,12 @@ def check_files(request_path, purchases_path, registry_path, key, logs):
         report['files'] = {role: file_info(path) for role, path in zip(report['files'],
                            (request_path, purchases_path, registry_path))}
         title, request = read_request(request_path)
-        purchases = read_purchases(purchases_path)
+        articles_by_name = {}
+        purchases = read_purchases(purchases_path, articles_by_name)
         register, registry_date = read_registry(registry_path)
         report['files']['Заявка']['sheet'] = title
         report['files']['Реестр']['exported'] = registry_date
-        results, pending = compare(request, purchases, register)
+        results, pending = compare(request, purchases, register, articles_by_name)
         report.update(rows=results, ai=add_suggestions(pending, key))
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'
@@ -422,46 +457,100 @@ def locations_text(row):
 
 
 def item_text(item):
-    return (f'{item["source"]} {item["id"]} | {" / ".join(item["articles"])} {item["name"]} | '
-            f'{show_number(item["quantity"])} {item["unit"]} | {item["place"]}'.rstrip(' |'))
+    quantity = 'количество не указано' if item['quantity'] is None else f'{show_number(item["quantity"])} {item["unit"]}'.strip()
+    checked = ('проверено' if item['checked'] else 'без отметки проверки') if item['source'] == 'Реестр' else ''
+    return ' | '.join(filter(None, [f'{item["source"]} {item["id"]}', ' / '.join(item['articles']), item['name'],
+                                    quantity, item['place'], checked]))
 
 
-def write_report(report, path):
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = 'Проверка заявки'
-    sheet.append(['Строка', 'Артикул', 'Позиция', 'Ед.', 'Нужно', 'Взять', 'Докупить', 'Статус', 'Адрес и количество',
-                  'Причина', 'Закупки', 'Реестр', 'Подсказки DeepSeek', 'Кандидаты'])
+def inventory_text(row):
+    quantity = row['stock_qty']
+    counted = f'{show_number(quantity)} {row["stock_unit"]}'.strip() if quantity is not None else ''
+    if row['stock_uncounted']:
+        return f'{counted} + не считали' if quantity else 'Не пересчитано'
+    if counted:
+        return counted
+    return 'См. реестр' if row['stock_found'] and row['registry'] else '—'
+
+
+def availability_rows(rows):
+    groups = {}
+    for row in rows:
+        if not row['stock_found'] or row['need'] is None or row['need'] <= 0:
+            continue
+        register = tuple(sorted(item['id'] for item in row['registry'] if item['quantity'] is None or item['quantity'] > 0))
+        stock_ids = register or tuple(sorted(item['id'] for item in row['purchases']))
+        groups.setdefault(('registry' if register else 'purchases', stock_ids, unit_key(row['unit'])), []).append(row)
+    for members in groups.values():
+        first = members[0]
+        free = {(item['free_qty'], item['free_unit']) for item in members}
+        free_qty, free_unit = next(iter(free)) if len(free) == 1 else (None, '')
+        issued = [item['take'] for item in members]
+        register_codes = dict.fromkeys(code for item in first['registry'] for code in item['articles'])
+        status = 'Требуется пересчёт' if first['stock_uncounted'] else 'См. данные по строкам'
+        if len({item['reason'] for item in members}) == 1:
+            status = first['reason']
+        yield [', '.join(str(item['row']) for item in members), ' / '.join(dict.fromkeys(
+            item['article'] or item['matched_article'] for item in members if item['article'] or item['matched_article'])),
+            first['name'], sum(item['need'] for item in members), unit_key(first['unit']), ' / '.join(register_codes),
+            first['stock_qty'], first['stock_unit'], ', '.join(first['stock_places']), free_qty, free_unit,
+            sum(issued) if all(quantity is not None for quantity in issued) else None, status]
+
+
+def format_sheet(sheet, widths, filters=True):
+    for row in sheet.iter_rows(min_row=2):
+        for cell in row:
+            if isinstance(cell.value, str):
+                cell.data_type = 's'
+            cell.alignment = Alignment(vertical='top', wrap_text=True)
+    for cell, width in zip(sheet[1], widths):
+        sheet.column_dimensions[cell.column_letter].width = width
+        cell.fill = PatternFill('solid', fgColor='163D34')
+        cell.font = Font(name='Segoe UI', color='FFFFFF', bold=True)
+        cell.alignment = Alignment(vertical='center', wrap_text=True)
+    sheet.row_dimensions[1].height = 28
+    sheet.freeze_panes = 'D2'
+    if filters:
+        sheet.auto_filter.ref = sheet.dimensions
+
+
+def add_full_report(workbook, report):
+    sheet = workbook.create_sheet('Проверка заявки')
+    sheet.append(['Строка', 'Артикул', 'Позиция', 'Ед.', 'Нужно', 'Взять', 'Докупить', 'Статус', 'Полка',
+                  'По реестру', 'Свободно по «Закупкам»', 'Причина', 'Закупки', 'Реестр', 'Подсказки DeepSeek', 'Кандидаты'])
     for row in report['rows']:
         sheet.append([row['row'], row['article'], row['name'], row['unit'], row['need'], row['take'], row['buy'],
-                      row['status'], locations_text(row), row['reason'],
+                      row['status'], locations_text(row) or ', '.join(row['stock_places']), inventory_text(row),
+                      row['free_qty'], row['reason'],
                       '\n'.join(map(item_text, row['purchases'])), '\n'.join(map(item_text, row['registry'])),
                       '\n'.join(('Та же позиция: ' if item['relation'] == 'same' else 'Аналог: ') + item_text(item)
                                 for item in row.get('suggestions', [])),
                       '\n'.join(map(item_text, row.get('candidates', [])))])
-    for cells in sheet.iter_rows(min_row=2):
-        for cell in cells:
-            if isinstance(cell.value, str):
-                cell.data_type = 's'
-            cell.alignment = Alignment(vertical='top', wrap_text=True)
-    sheet.freeze_panes = 'E2'
-    sheet.auto_filter.ref = sheet.dimensions
-    for cell, width in zip(sheet[1], (10, 22, 45, 10, 11, 11, 11, 24, 30, 50, 55, 55, 55, 55)):
-        sheet.column_dimensions[cell.column_letter].width = width
-        cell.fill = PatternFill('solid', fgColor='234744')
-        cell.font = Font(color='FFFFFF', bold=True)
+    format_sheet(sheet, (10, 22, 45, 10, 11, 11, 11, 24, 26, 20, 22, 52, 55, 55, 55, 55))
+
+
+def write_report(report, path, inventory_only=False):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = 'Наличие'
+    sheet.append(['Строки заявки', 'Артикул заявки', 'Позиция', 'Нужно', 'Ед. заявки', 'Артикул в реестре',
+                  'Кол-во в реестре', 'Ед. реестра', 'Полка', 'Свободно по «Закупкам»', 'Ед. «Закупок»',
+                  'Взять', 'Что проверить'])
+    for row in availability_rows(report['rows']):
+        sheet.append(row)
+    if sheet.max_row == 1:
+        sheet.append([None, None, 'По этой заявке позиции в наличии не найдены.'])
+    format_sheet(sheet, (13, 25, 58, 10, 12, 24, 17, 13, 17, 22, 14, 11, 61))
+    if not inventory_only:
+        add_full_report(workbook, report)
     sources = workbook.create_sheet('Источники')
     sources.append(['Источник', 'Файл', 'Дата изменения файла', 'Лист / дата выгрузки реестра'])
     for role, item in report['files'].items():
         sources.append([role, item['file'], item['modified'], item.get('sheet') or item.get('exported')])
     sources.append(['DeepSeek', report['ai']])
     sources.append(['Дата проверки', report['time']])
-    for row in sources:
-        for cell in row:
-            if isinstance(cell.value, str):
-                cell.data_type = 's'
-    for column, width in zip('ABCD', (20, 65, 30, 42)):
-        sources.column_dimensions[column].width = width
+    format_sheet(sources, (20, 72, 31, 42), filters=False)
+    sources.freeze_panes = 'A2'
     temporary = path.with_name(f'.{path.stem}-{uuid4().hex}.tmp')
     try:
         workbook.save(temporary)

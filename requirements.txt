@@ -1,0 +1,2 @@
+openpyxl==3.1.5
+keyring>=25,<26; sys_platform == 'win32'

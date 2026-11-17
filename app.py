@@ -19,8 +19,13 @@ EXCEL = [('Книга Excel', '*.xlsx *.xlsm')]
 REGISTER = [('Реестр склада', '*.json')]
 ZOOMS = ('Авто', '100%', '115%', '130%', '150%', '175%', '200%')
 FILTERS = ('Все позиции', 'Найдено на складе', 'Требуется уточнение')
-CANVAS, PAPER, INK, MUTED = '#e9eee9', '#ffffff', '#182e28', '#485e55'
-GREEN, DARK_GREEN, LINE = '#24634e', '#163d34', '#d3ded6'
+CANVAS, PAPER, SIDEBAR = '#e5ecef', '#fbfcfd', '#eef3f5'
+INK, MUTED, LINE = '#172c36', '#425b68', '#c2d1d8'
+MAST, ACCENT, SHELF_MARK = '#203b49', '#235568', '#e3bf70'
+TYPE_SCALE = {
+    'body': (11, 'normal'), 'small': (10, 'normal'), 'action': (10, 'bold'),
+    'heading': (15, 'bold'), 'title': (27, 'bold'), 'number': (17, 'bold'),
+}
 COLUMNS = (
     ('row', 'Стр.', 49), ('article', 'Артикул', 156), ('name', 'Номенклатура', 260),
     ('need', 'Нужно', 83), ('stock', 'По реестру', 125), ('free', 'Свободно', 86),
@@ -88,12 +93,10 @@ class App:
         self.screen = (root.winfo_screenwidth(), root.winfo_screenheight())
         self.style = ttk.Style(root)
         available = set(font.families(root))
-        face = next((name for name in ('Inter', 'Segoe UI', 'DejaVu Sans') if name in available), 'TkDefaultFont')
+        face = next((name for name in ('Source Sans 3', 'Inter', 'Segoe UI', 'DejaVu Sans') if name in available),
+                    font.nametofont('TkDefaultFont', root=root).actual('family'))
         self.fonts = {key: font.Font(root, family=face, size=size, weight=weight)
-                      for key, (size, weight) in {
-                          'body': (11, 'normal'), 'small': (9, 'normal'), 'action': (10, 'bold'),
-                          'heading': (15, 'bold'), 'title': (25, 'bold'), 'number': (19, 'bold'),
-                      }.items()}
+                      for key, (size, weight) in TYPE_SCALE.items()}
         self.configure_styles()
         prefs = read_settings()
         self.path_values = {
@@ -115,13 +118,13 @@ class App:
         root.columnconfigure(0, weight=1)
         root.rowconfigure(1, weight=1)
         self.build_header()
-        body = ttk.Frame(root, style='Canvas.TFrame', padding=self.px(18))
+        body = ttk.Frame(root, style='Canvas.TFrame', padding=(self.px(20), self.px(16)))
         body.grid(row=1, column=0, sticky='nsew')
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
         self.build_sidebar(body)
         self.build_workspace(body)
-        ttk.Label(root, textvariable=self.status, style='Status.TLabel', anchor='w', padding=(self.px(22), self.px(10))).grid(
+        ttk.Label(root, textvariable=self.status, style='Status.TLabel', anchor='w', padding=(self.px(20), self.px(8))).grid(
             row=2, column=0, sticky='ew')
 
         self.set_zoom()
@@ -147,56 +150,73 @@ class App:
         f = self.fonts
         self.style.configure('Canvas.TFrame', background=CANVAS)
         self.style.configure('Paper.TFrame', background=PAPER)
-        self.style.configure('Mast.TFrame', background=DARK_GREEN)
-        self.style.configure('Mast.TLabel', background=DARK_GREEN, foreground='#ffffff', font=f['title'])
-        self.style.configure('Brand.TLabel', background=DARK_GREEN, foreground='#d0e2d8', font=f['action'])
-        self.style.configure('Paper.TLabel', background=PAPER, foreground=INK, font=f['body'])
+        self.style.configure('Sidebar.TFrame', background=SIDEBAR)
+        self.style.configure('Mast.TFrame', background=MAST)
+        self.style.configure('Mast.TLabel', background=MAST, foreground=PAPER, font=f['title'])
+        self.style.configure('Brand.TLabel', background=MAST, foreground='#d9e6ec', font=f['small'])
+        self.style.configure('ShelfMark.TFrame', background=SHELF_MARK)
+        self.style.configure('Rule.TFrame', background=LINE)
+        self.style.configure('SideHeading.TLabel', background=SIDEBAR, foreground=INK, font=f['heading'])
+        self.style.configure('SideField.TLabel', background=SIDEBAR, foreground=INK, font=f['action'])
+        self.style.configure('SideNote.TLabel', background=SIDEBAR, foreground=MUTED, font=f['small'])
+        self.style.configure('Paper.TLabel', background=PAPER, foreground=INK, font=f['action'])
         self.style.configure('Section.TLabel', background=PAPER, foreground=INK, font=f['heading'])
-        self.style.configure('Metric.TLabel', background=PAPER, foreground=DARK_GREEN, font=f['number'])
+        self.style.configure('Metric.TLabel', background=PAPER, foreground=MAST, font=f['number'])
         self.style.configure('Muted.TLabel', background=PAPER, foreground=MUTED, font=f['small'])
-        self.style.configure('Status.TLabel', background='#dce7df', foreground=INK, font=f['small'])
-        self.style.configure('TButton', font=f['action'], padding=(self.px(11), self.px(6)), borderwidth=1,
-                             background='#eef3ef', foreground=INK, bordercolor=LINE, focusthickness=1, focuscolor=GREEN)
-        self.style.map('TButton', background=[('active', '#dce9e0')], foreground=[('disabled', '#738078')])
-        self.style.configure('Primary.TButton', foreground='#ffffff', background=GREEN,
-                             bordercolor=GREEN, padding=(self.px(12), self.px(10)))
-        self.style.map('Primary.TButton', background=[('disabled', '#dbe6df'), ('active', DARK_GREEN)],
-                       foreground=[('disabled', '#54675d'), ('!disabled', '#ffffff')])
-        self.style.configure('TEntry', padding=(self.px(7), self.px(5)), bordercolor=LINE, fieldbackground='#f9fbf9')
-        self.style.map('TEntry', bordercolor=[('focus', GREEN)])
-        self.style.configure('TCombobox', padding=(self.px(7), self.px(4)), bordercolor=LINE, fieldbackground='#f9fbf9')
+        self.style.configure('Status.TLabel', background=SIDEBAR, foreground=MUTED, font=f['small'])
+        self.style.configure('TButton', font=f['action'], padding=(self.px(11), self.px(6)), borderwidth=1, relief='flat',
+                             background=PAPER, foreground=INK, bordercolor=LINE, lightcolor=PAPER, darkcolor=PAPER,
+                             focusthickness=2, focuscolor=ACCENT)
+        self.style.map('TButton', background=[('pressed', '#d1e1e8'), ('active', '#e0ebf0')],
+                       bordercolor=[('focus', ACCENT)], foreground=[('disabled', '#556a74')])
+        self.style.configure('Primary.TButton', foreground=PAPER, background=ACCENT, bordercolor=ACCENT,
+                             lightcolor=ACCENT, darkcolor=ACCENT, padding=(self.px(12), self.px(8)), focuscolor=PAPER)
+        self.style.map('Primary.TButton', background=[('disabled', '#dce6eb'), ('pressed', '#214555'), ('active', MAST)],
+                       bordercolor=[('disabled', LINE), ('focus', ACCENT)], foreground=[('disabled', MUTED)])
+        self.style.configure('TEntry', padding=(self.px(8), self.px(5)), bordercolor=LINE, fieldbackground=PAPER,
+                             foreground=INK, insertcolor=INK, lightcolor=PAPER, darkcolor=PAPER)
+        self.style.map('TEntry', bordercolor=[('focus', ACCENT)], lightcolor=[('focus', ACCENT)])
+        self.style.configure('TCombobox', padding=(self.px(8), self.px(4)), bordercolor=LINE, fieldbackground=PAPER,
+                             foreground=INK, arrowcolor=MAST)
+        self.style.map('TCombobox', fieldbackground=[('readonly', PAPER)], bordercolor=[('focus', ACCENT)],
+                       lightcolor=[('focus', ACCENT)])
         self.style.configure('Treeview', font=f['body'], background=PAPER, fieldbackground=PAPER,
                              foreground=INK, borderwidth=0)
-        self.style.configure('Treeview.Heading', font=f['action'], background='#e1ebe4',
-                             foreground=DARK_GREEN, padding=(self.px(5), self.px(7)), relief='flat', borderwidth=0)
-        self.style.map('Treeview', background=[('selected', '#c2e0ce')], foreground=[('selected', '#12392e')])
-        self.style.configure('TScrollbar', arrowsize=self.px(13), background='#d4e2d8', troughcolor='#f1f5f2')
+        self.style.configure('Treeview.Heading', font=f['action'], background='#d7e5ec',
+                             foreground=MAST, padding=(self.px(7), self.px(8)), relief='flat', borderwidth=1,
+                             bordercolor=LINE, lightcolor='#d7e5ec', darkcolor='#d7e5ec')
+        self.style.map('Treeview.Heading', background=[('active', '#d7e5ec')])
+        self.style.map('Treeview', background=[('selected', '#b9d9e4')], foreground=[('selected', INK)])
+        self.style.configure('TScrollbar', arrowsize=self.px(13), background='#cfdee5', troughcolor=SIDEBAR,
+                             bordercolor=LINE, arrowcolor=MUTED)
 
     def build_header(self):
-        top = ttk.Frame(self.root, style='Mast.TFrame', padding=(self.px(23), self.px(13)))
+        top = ttk.Frame(self.root, style='Mast.TFrame', padding=(self.px(20), self.px(12)))
         top.grid(row=0, column=0, sticky='ew')
-        top.columnconfigure(0, weight=1)
-        ttk.Label(top, text='Склад Массивбург', style='Brand.TLabel').grid(row=0, column=0, sticky='w')
-        ttk.Label(top, text='Проверка заявки', style='Mast.TLabel').grid(row=1, column=0, sticky='w')
-        ttk.Label(top, text='Масштаб', style='Brand.TLabel').grid(row=1, column=1, padx=(0, self.px(9)))
+        top.columnconfigure(1, weight=1)
+        ttk.Frame(top, width=self.px(5), style='ShelfMark.TFrame').grid(
+            row=0, column=0, rowspan=2, sticky='ns', padx=(0, self.px(12)), pady=self.px(3))
+        ttk.Label(top, text='Склад Массивбург', style='Brand.TLabel').grid(row=0, column=1, sticky='w')
+        ttk.Label(top, text='Проверка заявки', style='Mast.TLabel').grid(row=1, column=1, sticky='w')
+        ttk.Label(top, text='Масштаб', style='Brand.TLabel').grid(row=0, column=2, rowspan=2, padx=(0, self.px(9)))
         ttk.Combobox(top, textvariable=self.zoom, values=ZOOMS, state='readonly', width=8,
-                     font=self.fonts['body']).grid(row=1, column=2, sticky='e')
+                     font=self.fonts['body']).grid(row=0, column=3, rowspan=2, sticky='e')
         self.zoom.trace_add('write', lambda *_: self.set_zoom())
 
     def build_sidebar(self, parent):
-        panel = ttk.Frame(parent, style='Paper.TFrame', padding=self.px(16))
+        panel = ttk.Frame(parent, style='Sidebar.TFrame', padding=self.px(16))
         panel.grid(row=0, column=0, sticky='ns', padx=(0, self.px(15)))
         panel.columnconfigure(0, weight=1)
-        ttk.Label(panel, text='Файлы проверки', style='Section.TLabel').grid(row=0, columnspan=2, sticky='w',
-                                                                           pady=(0, self.px(11)))
+        ttk.Label(panel, text='Файлы проверки', style='SideHeading.TLabel').grid(
+            row=0, columnspan=2, sticky='w', pady=(0, self.px(15)))
         for row, (role, label, types) in enumerate((
             ('Заявка', 'Заявка конструктора', EXCEL),
             ('Закупки', 'Закупки', EXCEL),
             ('Реестр', 'Реестр сверки склада', REGISTER),
         )):
             self.path_input(panel, 1 + 2 * row, role, label, types)
-        ttk.Separator(panel).grid(row=7, columnspan=2, sticky='ew', pady=self.px(15))
-        ttk.Label(panel, text='DeepSeek', style='Section.TLabel').grid(row=8, columnspan=2, sticky='w')
+        ttk.Frame(panel, height=self.px(1), style='Rule.TFrame').grid(row=7, columnspan=2, sticky='ew', pady=self.px(13))
+        ttk.Label(panel, text='DeepSeek', style='SideHeading.TLabel').grid(row=8, columnspan=2, sticky='w')
         self.key_entry = ttk.Entry(panel, textvariable=self.key, show='•', font=self.fonts['body'], width=25)
         self.key_entry.grid(row=9, columnspan=2, sticky='ew', pady=(self.px(8), self.px(5)))
         self.key_entry.bind('<Control-v>', self.paste_key)
@@ -209,7 +229,7 @@ class App:
         ttk.Button(panel, text='Вставить', command=self.paste_key).grid(row=10, column=0, sticky='ew',
                                                                        padx=(0, self.px(5)))
         ttk.Button(panel, text='Запомнить ключ', command=self.remember_key).grid(row=10, column=1, sticky='ew')
-        self.key_feedback = ttk.Label(panel, textvariable=self.key_note, style='Muted.TLabel')
+        self.key_feedback = ttk.Label(panel, textvariable=self.key_note, style='SideNote.TLabel')
         self.key_feedback.grid(row=11, columnspan=2, sticky='w', pady=(self.px(6), self.px(14)))
         self.run_button = ttk.Button(panel, text='Проверить заявку', style='Primary.TButton', command=self.run)
         self.run_button.grid(row=12, columnspan=2, sticky='ew')
@@ -217,7 +237,7 @@ class App:
                                                                                pady=(self.px(8), 0))
 
     def path_input(self, panel, row, role, label, filetypes):
-        ttk.Label(panel, text=label, style='Paper.TLabel').grid(row=row, column=0, columnspan=2, sticky='w')
+        ttk.Label(panel, text=label, style='SideField.TLabel').grid(row=row, column=0, columnspan=2, sticky='w')
         variable = self.path_values[role]
         entry = ttk.Entry(panel, textvariable=variable, font=self.fonts['body'], width=23)
         entry.grid(row=row + 1, column=0, sticky='ew', pady=(self.px(4), self.px(12)), padx=(0, self.px(5)))
@@ -252,12 +272,18 @@ class App:
                                            style='Primary.TButton', command=lambda: self.export(inventory_only=True))
         self.export_inventory.grid(row=0, column=2)
 
-        metrics = ttk.Frame(panel, style='Paper.TFrame')
-        metrics.grid(row=1, column=0, sticky='ew', pady=(0, self.px(9)))
+        metrics = ttk.Frame(panel, style='Paper.TFrame', padding=(0, self.px(5), 0, self.px(9)))
+        metrics.grid(row=1, column=0, sticky='ew', pady=(0, self.px(8)))
         for col, title in enumerate(('Позиций в заявке', 'Найдено на складе', 'Есть с количеством')):
-            metrics.columnconfigure(col, weight=1, uniform='metrics')
-            ttk.Label(metrics, textvariable=self.stats[col], style='Metric.TLabel').grid(row=0, column=col, sticky='w')
-            ttk.Label(metrics, text=title, style='Muted.TLabel').grid(row=1, column=col, sticky='w')
+            column = col * 2
+            metrics.columnconfigure(column, weight=1, uniform='metrics')
+            inset = self.px(14) if col else 0
+            if col:
+                ttk.Frame(metrics, width=self.px(1), style='Rule.TFrame').grid(
+                    row=0, column=column - 1, rowspan=2, sticky='ns', pady=self.px(3))
+            ttk.Label(metrics, text=title, style='Muted.TLabel').grid(row=0, column=column, sticky='w', padx=(inset, 0))
+            ttk.Label(metrics, textvariable=self.stats[col], style='Metric.TLabel').grid(
+                row=1, column=column, sticky='w', padx=(inset, 0))
         tools = ttk.Frame(panel, style='Paper.TFrame')
         tools.grid(row=2, column=0, sticky='ew', pady=(0, self.px(7)))
         tools.columnconfigure(2, weight=1)
@@ -269,15 +295,16 @@ class App:
         self.query.trace_add('write', lambda *_: self.fill_table())
         self.build_table(panel)
 
-        details = ttk.Frame(panel, style='Paper.TFrame', padding=(0, self.px(10), 0, 0))
+        details = ttk.Frame(panel, style='Paper.TFrame', padding=(0, self.px(13), 0, 0))
         details.grid(row=4, column=0, sticky='nsew')
         details.columnconfigure(0, weight=1)
         details.rowconfigure(1, weight=1)
         ttk.Label(details, text='Данные по позиции', style='Paper.TLabel').grid(row=0, column=0, sticky='w',
                                                                                pady=(0, self.px(4)))
         self.detail = tk.Text(details, height=4, wrap='word', font=self.fonts['body'], state='disabled',
-                              foreground=INK, background='#f3f7f4', borderwidth=0,
-                              padx=self.px(11), pady=self.px(8), highlightthickness=0)
+                              foreground=INK, background=SIDEBAR, borderwidth=0, spacing1=self.px(2),
+                              padx=self.px(12), pady=self.px(8), highlightthickness=self.px(1),
+                              highlightbackground=LINE, highlightcolor=ACCENT)
         self.detail.grid(row=1, column=0, sticky='nsew')
         scroll = ttk.Scrollbar(details, command=self.detail.yview)
         scroll.grid(row=1, column=1, sticky='ns')
@@ -299,9 +326,9 @@ class App:
         horizontal = ttk.Scrollbar(panel, orient='horizontal', command=self.table.xview)
         horizontal.grid(row=1, column=0, sticky='ew')
         self.table.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        self.table.tag_configure('confirmed', background='#e5f3e9')
-        self.table.tag_configure('found', background='#fff2d9')
-        self.table.tag_configure('stripe', background='#f1f5f2')
+        self.table.tag_configure('confirmed', background='#dcece8')
+        self.table.tag_configure('found', background='#f7edd8')
+        self.table.tag_configure('stripe', background='#f0f5f7')
         self.table.bind('<<TreeviewSelect>>', self.show_details)
         self.empty = ttk.Label(panel, text='Загрузите файлы и запустите проверку.', style='Muted.TLabel')
         self.empty.place(relx=.5, rely=.5, anchor='center')
@@ -309,7 +336,7 @@ class App:
     def set_zoom(self):
         choice = self.zoom.get()
         factor = zoom_factor(choice, self.screen[0], self.dpi)
-        for key, size in {'body': 11, 'small': 9, 'action': 10, 'heading': 15, 'title': 25, 'number': 19}.items():
+        for key, (size, _) in TYPE_SCALE.items():
             self.fonts[key].configure(size=round(size * factor))
         self.style.configure('Treeview', rowheight=self.px(31 * factor))
         for col, _, width in COLUMNS:

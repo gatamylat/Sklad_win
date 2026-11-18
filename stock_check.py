@@ -4,6 +4,7 @@ import json
 import re
 import unicodedata
 from collections import Counter, defaultdict
+from concurrent.futures import CancelledError
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -267,19 +268,44 @@ def availability(purchases, register):
     }
 
 
+def match_requests(request, purchase_catalog, register_catalog, articles_by_name):
+    groups = {}
+    matches = []
+    for row in request:
+        identified = articles_by_name.get(name_key(row['name']), '') if not row['article'] else ''
+        lookup = {**row, 'article': identified} if identified else row
+        buy = purchase_catalog.exact(lookup, purchases=True)
+        stock = register_catalog.exact(lookup)
+        units = unit_key(row['unit'])
+        signature = None
+        if row.get('request_lines') and row['need'] is not None and row['need'] > 0 and units and (buy or stock):
+            codes = {article_key(code) for item in buy for code in item.articles}
+            generic_purchase = not stock and not codes and bool(article_key(lookup['article']))
+            if len(buy) <= 1 and len(codes) <= 1 and not generic_purchase:
+                signature = (units, tuple(sorted(item.id for item in buy)), tuple(sorted(item.id for item in stock)))
+        if signature is not None and signature in groups:
+            existing = groups[signature]
+            existing['need'] += row['need']
+            existing['request_lines'].extend(row['request_lines'])
+        else:
+            result = {**row, 'matched_article': identified}
+            if 'request_lines' in result:
+                result['request_lines'] = list(result['request_lines'])
+            matches.append((result, lookup, buy, stock))
+            if signature is not None:
+                groups[signature] = result
+    return matches
+
+
 def compare(request, purchases, registry, articles_by_name=None):
     purchase_catalog, register_catalog = Catalog(purchases), Catalog(registry)
     purchase_left = {item.id: item.qty for item in purchases}
     register_left = {item.id: item.qty for item in registry}
     results, pending = [], []
-    for row in request:
-        identified = (articles_by_name or {}).get(name_key(row['name']), '') if not row['article'] else ''
-        lookup = {**row, 'article': identified} if identified else row
-        buy = purchase_catalog.exact(lookup, purchases=True)
-        stock = register_catalog.exact(lookup)
+    for row, lookup, buy, stock in match_requests(request, purchase_catalog, register_catalog, articles_by_name or {}):
         result = {**row, 'take': None, 'buy': None, 'status': MANUAL, 'locations': [],
                   'purchases': [evidence(p) for p in buy], 'registry': [evidence(p) for p in stock],
-                  'matched_article': identified, **availability(buy, stock)}
+                  **availability(buy, stock)}
         reason = compare_row(result, buy, stock, purchase_left, register_left)
         if reason:
             result['reason'] = reason
@@ -337,7 +363,7 @@ def compare_row(result, purchases, register, purchase_left, register_left):
     purchase_left[purchase.id] -= take
     result.update(take=take, buy=need - take, status=('Взять со склада' if take == need else
                   'Частично со склада' if take else 'Докупить'),
-                  reason='Количество рассчитано по подтверждённым остаткам с учётом предыдущих строк заявки.')
+                  reason='Количество рассчитано по подтверждённым остаткам с учётом предыдущих позиций.')
     return ''
 
 
@@ -376,7 +402,7 @@ def deepseek_request(key, batch):
         raise ValueError('DeepSeek вернул неполный или нечитаемый ответ.') from None
 
 
-def add_suggestions(pending, key, ask=deepseek_request):
+def add_suggestions(pending, key, ask=deepseek_request, cancel=None):
     for row, candidates in pending:
         row['candidates'] = [evidence(item) for item in candidates]
         row['suggestions'] = []
@@ -385,6 +411,7 @@ def add_suggestions(pending, key, ask=deepseek_request):
     if not key:
         return 'Ключ DeepSeek не задан. Похожие позиции показаны для ручной проверки.'
     for start in range(0, len(pending), 12):
+        check_cancelled(cancel)
         batch = pending[start:start + 12]
         allowed = {row['row']: (row, candidates) for row, candidates in batch}
         try:
@@ -423,22 +450,52 @@ def save_log(directory, data):
     return target
 
 
-def check_files(request_path, purchases_path, registry_path, key, logs):
-    report = {'time': datetime.now().astimezone().isoformat(timespec='seconds'), 'files': {
-        'Заявка': {'file': request_path.name}, 'Закупки': {'file': purchases_path.name},
-        'Реестр': {'file': registry_path.name}}}
+def check_cancelled(cancel):
+    if cancel is not None and cancel():
+        raise CancelledError()
+
+
+def read_input(path, reader, *args):
     try:
-        report['files'] = {role: file_info(path) for role, path in zip(report['files'],
-                           (request_path, purchases_path, registry_path))}
-        title, request = read_request(request_path)
-        articles_by_name = {}
-        purchases = read_purchases(purchases_path, articles_by_name)
-        register, registry_date = read_registry(registry_path)
-        report['files']['Заявка']['sheet'] = title
-        report['files']['Реестр']['exported'] = registry_date
-        results, pending = compare(request, purchases, register, articles_by_name)
-        report.update(rows=results, ai=add_suggestions(pending, key))
+        return file_info(path), reader(path, *args)
     except Exception as error:
+        raise ValueError(f'Не удалось прочитать «{path.name}». Замените файл. {error}') from error
+
+
+def check_files(request_path, purchases_path, registry_path, key, logs, cancel=None):
+    paths = (request_path,) if isinstance(request_path, Path) else tuple(request_path)
+    if not paths:
+        raise ValueError('Добавьте хотя бы одну заявку Excel.')
+    roles = ['Заявка'] if len(paths) == 1 else [f'Заявка {number}' for number in range(1, len(paths) + 1)]
+    files = {role: {'file': path.name} for role, path in zip(roles, paths)}
+    files.update(Закупки={'file': purchases_path.name}, Реестр={'file': registry_path.name})
+    report = {'time': datetime.now().astimezone().isoformat(timespec='seconds'), 'files': files,
+              'request_count': len(paths)}
+    try:
+        request = []
+        for role, path in zip(roles, paths):
+            check_cancelled(cancel)
+            info, (title, rows) = read_input(path, read_request)
+            files[role] = {**info, 'sheet': title}
+            for row in rows:
+                line = {**row, 'file': path.name, 'sheet': title, 'request': role}
+                index = row['row'] if len(paths) == 1 else len(request) + 1
+                request.append({**row, 'row': index, 'request_lines': [line]})
+        check_cancelled(cancel)
+        articles_by_name = {}
+        files['Закупки'], purchases = read_input(purchases_path, read_purchases, articles_by_name)
+        check_cancelled(cancel)
+        files['Реестр'], (register, registry_date) = read_input(registry_path, read_registry)
+        files['Реестр']['exported'] = registry_date
+        check_cancelled(cancel)
+        results, pending = compare(request, purchases, register, articles_by_name)
+        check_cancelled(cancel)
+        report.update(rows=results, ai=add_suggestions(pending, key, cancel=cancel))
+        check_cancelled(cancel)
+    except CancelledError:
+        raise
+    except Exception as error:
+        check_cancelled(cancel)
         report['error'] = f'{type(error).__name__}: {error}'
         save_log(logs, report)
         raise
@@ -480,21 +537,26 @@ def availability_rows(rows):
             continue
         register = tuple(sorted(item['id'] for item in row['registry'] if item['quantity'] is None or item['quantity'] > 0))
         stock_ids = register or tuple(sorted(item['id'] for item in row['purchases']))
-        groups.setdefault(('registry' if register else 'purchases', stock_ids, unit_key(row['unit'])), []).append(row)
+        group_id = row['row'] if row.get('request_lines') else None
+        groups.setdefault(('registry' if register else 'purchases', stock_ids, unit_key(row['unit']), group_id), []).append(row)
     for members in groups.values():
         first = members[0]
         free = {(item['free_qty'], item['free_unit']) for item in members}
         free_qty, free_unit = next(iter(free)) if len(free) == 1 else (None, '')
         issued = [item['take'] for item in members]
+        shortfall = [item['buy'] for item in members]
         register_codes = dict.fromkeys(code for item in first['registry'] for code in item['articles'])
         status = 'Требуется пересчёт' if first['stock_uncounted'] else 'См. данные по строкам'
         if len({item['reason'] for item in members}) == 1:
             status = first['reason']
-        yield [', '.join(str(item['row']) for item in members), ' / '.join(dict.fromkeys(
+        refs = [f'{line["request"]}: {line["sheet"]}!{line["row"]}' for item in members
+                for line in item.get('request_lines', [])]
+        yield [', '.join(refs or [str(item['row']) for item in members]), ' / '.join(dict.fromkeys(
             item['article'] or item['matched_article'] for item in members if item['article'] or item['matched_article'])),
             first['name'], sum(item['need'] for item in members), unit_key(first['unit']), ' / '.join(register_codes),
             first['stock_qty'], first['stock_unit'], ', '.join(first['stock_places']), free_qty, free_unit,
-            sum(issued) if all(quantity is not None for quantity in issued) else None, status]
+            sum(issued) if all(quantity is not None for quantity in issued) else None, status,
+            sum(shortfall) if all(quantity is not None for quantity in shortfall) else None]
 
 
 def format_sheet(sheet, widths, filters=True):
@@ -516,10 +578,10 @@ def format_sheet(sheet, widths, filters=True):
 
 def add_full_report(workbook, report):
     sheet = workbook.create_sheet('Проверка заявки')
-    sheet.append(['Строка', 'Артикул', 'Позиция', 'Ед.', 'Нужно', 'Взять', 'Докупить', 'Статус', 'Полка',
+    sheet.append(['Позиция №', 'Артикул', 'Позиция', 'Ед.', 'Нужно всего', 'Взять', 'Докупить', 'Статус', 'Полка',
                   'По реестру', 'Свободно по «Закупкам»', 'Причина', 'Закупки', 'Реестр', 'Подсказки DeepSeek', 'Кандидаты'])
     for row in report['rows']:
-        sheet.append([row['row'], row['article'], row['name'], row['unit'], row['need'], row['take'], row['buy'],
+        sheet.append([row['row'], row['article'] or row.get('matched_article'), row['name'], row['unit'], row['need'], row['take'], row['buy'],
                       row['status'], locations_text(row) or ', '.join(row['stock_places']), inventory_text(row),
                       row['free_qty'], row['reason'],
                       '\n'.join(map(item_text, row['purchases'])), '\n'.join(map(item_text, row['registry'])),
@@ -527,20 +589,27 @@ def add_full_report(workbook, report):
                                 for item in row.get('suggestions', [])),
                       '\n'.join(map(item_text, row.get('candidates', [])))])
     format_sheet(sheet, (10, 22, 45, 10, 11, 11, 11, 24, 26, 20, 22, 52, 55, 55, 55, 55))
+    inputs = workbook.create_sheet('Строки заявок')
+    inputs.append(['Позиция №', 'Заявка', 'Файл', 'Лист', 'Строка', 'Артикул', 'Позиция', 'Нужно', 'Ед.'])
+    for row in report['rows']:
+        for line in row.get('request_lines', []):
+            inputs.append([row['row'], line['request'], line['file'], line['sheet'], line['row'], line['article'],
+                           line['name'], line['need'], line['unit']])
+    format_sheet(inputs, (11, 15, 45, 23, 11, 26, 54, 13, 10))
 
 
 def write_report(report, path, inventory_only=False):
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = 'Наличие'
-    sheet.append(['Строки заявки', 'Артикул заявки', 'Позиция', 'Нужно', 'Ед. заявки', 'Артикул в реестре',
+    sheet.append(['Строки заявок', 'Артикул заявки', 'Позиция', 'Нужно всего', 'Ед. заявки', 'Артикул в реестре',
                   'Кол-во в реестре', 'Ед. реестра', 'Полка', 'Свободно по «Закупкам»', 'Ед. «Закупок»',
-                  'Взять', 'Что проверить'])
+                  'Взять', 'Что проверить', 'Докупить'])
     for row in availability_rows(report['rows']):
         sheet.append(row)
     if sheet.max_row == 1:
-        sheet.append([None, None, 'По этой заявке позиции в наличии не найдены.'])
-    format_sheet(sheet, (13, 25, 58, 10, 12, 24, 17, 13, 17, 22, 14, 11, 61))
+        sheet.append([None, None, 'По выбранным заявкам позиции в наличии не найдены.'])
+    format_sheet(sheet, (38, 25, 58, 12, 12, 24, 17, 13, 17, 22, 14, 11, 61, 12))
     if not inventory_only:
         add_full_report(workbook, report)
     sources = workbook.create_sheet('Источники')

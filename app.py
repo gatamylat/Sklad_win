@@ -5,6 +5,8 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from concurrent.futures import CancelledError
+from math import hypot, sqrt
 from pathlib import Path
 from tkinter import filedialog, font, messagebox, ttk
 from uuid import uuid4
@@ -19,18 +21,18 @@ EXCEL = [('Книга Excel', '*.xlsx *.xlsm')]
 REGISTER = [('Реестр склада', '*.json')]
 ZOOMS = ('Авто', '100%', '115%', '130%', '150%', '175%', '200%')
 FILTERS = ('Все позиции', 'Найдено на складе', 'Требуется уточнение')
-CANVAS, PAPER, SIDEBAR = '#e5ecef', '#fbfcfd', '#eef3f5'
-INK, MUTED, LINE = '#172c36', '#425b68', '#c2d1d8'
-MAST, ACCENT, SHELF_MARK = '#203b49', '#235568', '#e3bf70'
-TYPE_SCALE = {
-    'body': (11, 'normal'), 'small': (10, 'normal'), 'action': (10, 'bold'),
-    'heading': (15, 'bold'), 'title': (27, 'bold'), 'number': (17, 'bold'),
+THEMES = {
+    'light': dict(bg='#FAF9F5', panel='#FFFFFF', fg='#1C1C1E', muted='#625D55', line='#E2DED5',
+                  selected='#F0E9DA', accent='#795222', on_accent='#FFFFFF'),
+    'dark': dict(bg='#1A1A1D', panel='#2C2C2E', fg='#F0EFEA', muted='#A5A6A7', line='#343537',
+                 selected='#34302B', accent='#DDB57D', on_accent='#1A1A1D'),
 }
 COLUMNS = (
-    ('row', 'Стр.', 49), ('article', 'Артикул', 156), ('name', 'Номенклатура', 260),
-    ('need', 'Нужно', 83), ('stock', 'По реестру', 125), ('free', 'Свободно', 86),
-    ('place', 'Полка', 105), ('take', 'Взять', 62), ('buy', 'Докупить', 81), ('status', 'Статус', 175),
+    ('article', 'Артикул', 127), ('name', 'Номенклатура', 204), ('need', 'Нужно всего', 105),
+    ('stock', 'По реестру', 112), ('free', 'Свободно', 86), ('place', 'Полка', 85),
+    ('take', 'Взять', 60), ('buy', 'Докупить', 80), ('status', 'Статус', 150),
 )
+NUMERIC = ('need', 'stock', 'free', 'take', 'buy')
 
 
 def enable_windows_dpi():
@@ -45,6 +47,15 @@ def enable_windows_dpi():
         windll.user32.SetProcessDPIAware()
 
 
+def load_windows_fonts():
+    if sys.platform == 'win32':
+        from ctypes import c_wchar_p, windll
+
+        directory = Path(__file__).resolve().parent / 'fonts'
+        for name in ('SkladDisplay-Medium.ttf', 'SkladSans-Regular.ttf'):
+            windll.gdi32.AddFontResourceExW(c_wchar_p(str(directory / name)), 0x10, None)
+
+
 def key_vault():
     if sys.platform == 'win32':
         from keyring.backends.Windows import WinVaultKeyring
@@ -57,7 +68,7 @@ def read_settings():
     try:
         data = json.loads(SETTINGS.read_text(encoding='utf-8'))
         return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, ValueError, OSError):
+    except (ValueError, OSError):
         return {}
 
 
@@ -82,55 +93,52 @@ def zoom_factor(choice, screen_width, dpi):
     return 1.15 if screen_width >= 2600 and dpi < 1.2 else 1
 
 
+def rounded_tile(root, radius, fill, border):
+    size = radius * 2 + 3
+    image = tk.PhotoImage(master=root, width=size, height=size)
+
+    def paint(color, inset):
+        curve = radius - inset
+        for y in range(inset, size - inset):
+            distance = max(0, curve - min(y - inset, size - 1 - inset - y))
+            margin = inset + round(curve - sqrt(curve ** 2 - distance ** 2))
+            image.put(color, to=(margin, y, size - margin, y + 1))
+
+    paint(border, 0)
+    paint(fill, 1)
+    return image
+
+
 class App:
     def __init__(self, root):
         self.root = root
         self.report = None
         self.input_files = ()
         self.events = queue.Queue()
-        self.started = False
-        self.dpi = float(root.tk.call('tk', 'scaling')) * 0.75
+        self.revision = 0
+        self.timer = None
+        self.running = None
+        self.cancellation = None
+        self.theme_images = {}
+        self.tooltip_timer = None
+        self.tooltip_window = None
+        self.dpi = float(root.tk.call('tk', 'scaling')) * .75
         self.screen = (root.winfo_screenwidth(), root.winfo_screenheight())
         self.style = ttk.Style(root)
-        available = set(font.families(root))
-        face = next((name for name in ('Source Sans 3', 'Inter', 'Segoe UI', 'DejaVu Sans') if name in available),
-                    font.nametofont('TkDefaultFont', root=root).actual('family'))
-        self.fonts = {key: font.Font(root, family=face, size=size, weight=weight)
-                      for key, (size, weight) in TYPE_SCALE.items()}
-        self.configure_styles()
+        self.style.theme_use('clam')
         prefs = read_settings()
-        self.path_values = {
-            'Заявка': tk.StringVar(), 'Закупки': tk.StringVar(value=str(prefs.get('purchases') or '')),
-            'Реестр': tk.StringVar(value=str(prefs.get('registry') or '')),
-        }
-        selected_zoom = prefs.get('zoom')
-        self.zoom = tk.StringVar(value=selected_zoom if selected_zoom in ZOOMS else ZOOMS[0])
+        self.theme = prefs.get('theme') if prefs.get('theme') in THEMES else 'light'
+        self.zoom = tk.StringVar(value=prefs.get('zoom') if prefs.get('zoom') in ZOOMS else 'Авто')
+        self.requests = []
+        self.sources = {role: Path(prefs[role]) if prefs.get(role) else None for role in ('purchases', 'registry')}
+        self.query = tk.StringVar()
+        self.filter = tk.StringVar(value=FILTERS[0])
+        self.summary = tk.StringVar(value='—')
+        self.status = tk.StringVar()
         self.key = tk.StringVar(value=os.getenv('DEEPSEEK_API_KEY', ''))
         self.key_note = tk.StringVar(value='Вставьте ключ из буфера обмена.')
-        self.status = tk.StringVar(value='Выберите файлы для проверки.')
-        self.sources = tk.StringVar()
-        self.filter = tk.StringVar(value=FILTERS[0])
-        self.query = tk.StringVar()
-        self.stats = [tk.StringVar(value='—') for _ in range(3)]
-
-        root.title('Склад Массивбург | Проверка заявки')
-        root.configure(background=CANVAS)
-        root.columnconfigure(0, weight=1)
-        root.rowconfigure(1, weight=1)
-        self.build_header()
-        body = ttk.Frame(root, style='Canvas.TFrame', padding=(self.px(20), self.px(16)))
-        body.grid(row=1, column=0, sticky='nsew')
-        body.columnconfigure(1, weight=1)
-        body.rowconfigure(0, weight=1)
-        self.build_sidebar(body)
-        self.build_workspace(body)
-        ttk.Label(root, textvariable=self.status, style='Status.TLabel', anchor='w', padding=(self.px(20), self.px(8))).grid(
-            row=2, column=0, sticky='ew')
-
-        self.set_zoom()
-        width, height = self.screen
-        root.geometry(f'{round(width * 0.91)}x{round(height * 0.87)}')
-        root.minsize(min(self.px(1030), round(width * .96)), min(self.px(660), round(height * .90)))
+        self.key_window = None
+        self.key_entry = None
         if not self.key.get():
             try:
                 vault = key_vault()
@@ -140,215 +148,465 @@ class App:
                 self.key_note.set('Хранилище ключей Windows недоступно.')
         if self.key.get():
             self.key_note.set('Ключ установлен.')
-        self.started = True
+
+        available = set(font.families(root))
+        fallback = font.nametofont('TkDefaultFont', root=root).actual('family')
+        body = next((name for name in ('Segoe UI', 'DejaVu Sans') if name in available), fallback)
+        latin = next((name for name in ('Sklad Sans', 'DM Sans') if name in available), body)
+        heading = next((name for name in ('Sklad Display', 'Playfair Display', 'Georgia', 'DejaVu Serif')
+                        if name in available), body)
+        self.fonts = {name: font.Font(root, family=family, size=-size, weight=weight)
+                      for name, (family, size, weight) in {
+                          'title': (heading, 22, 'normal'), 'section': (heading, 18, 'normal'),
+                          'body': (body, 14, 'normal'), 'strong': (body, 14, 'bold'),
+                          'button': (body, 13, 'normal'), 'small': (body, 12, 'normal'),
+                          'latin': (latin, 13, 'normal'), 'latin_data': (latin, 14, 'normal'),
+                      }.items()}
+        self.sizes = dict(title=22, section=18, body=14, strong=14, button=13, small=12, latin=13, latin_data=14)
+
+        root.title('Склад Массивбург')
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(2, weight=1)
+        self.build_header()
+        self.build_files()
+        self.build_workspace()
+        self.status_label = ttk.Label(root, textvariable=self.status, style='Small.TLabel', anchor='w',
+                                      padding=(self.px(24), self.px(9)))
+        self.status_label.grid(row=3, column=0, sticky='ew')
+        self.status_label.bind('<Configure>', lambda event: self.status_label.configure(
+            wraplength=max(self.px(100), event.width - self.px(48))))
+        self.zoom.trace_add('write', lambda *_: self.apply_zoom())
+        self.query.trace_add('write', lambda *_: self.fill_table())
+        self.filter.trace_add('write', lambda *_: self.fill_table())
+        root.bind('<Control-r>', self.manual_run)
+        root.bind('<Control-o>', lambda _: self.add_requests())
+        self.apply_zoom(remember=False)
+        self.refresh_files()
+        self.status.set(self.missing())
+        width, height = self.screen
+        root.geometry(f'{round(width * .92)}x{round(height * .89)}')
+        root.minsize(min(self.px(980), round(width * .96)), min(self.px(570), round(height * .91)))
 
     def px(self, size):
         return max(1, round(size * self.dpi))
 
-    def configure_styles(self):
-        self.style.theme_use('clam')
-        f = self.fonts
-        self.style.configure('Canvas.TFrame', background=CANVAS)
-        self.style.configure('Paper.TFrame', background=PAPER)
-        self.style.configure('Sidebar.TFrame', background=SIDEBAR)
-        self.style.configure('Mast.TFrame', background=MAST)
-        self.style.configure('Mast.TLabel', background=MAST, foreground=PAPER, font=f['title'])
-        self.style.configure('Brand.TLabel', background=MAST, foreground='#d9e6ec', font=f['small'])
-        self.style.configure('ShelfMark.TFrame', background=SHELF_MARK)
-        self.style.configure('Rule.TFrame', background=LINE)
-        self.style.configure('SideHeading.TLabel', background=SIDEBAR, foreground=INK, font=f['heading'])
-        self.style.configure('SideField.TLabel', background=SIDEBAR, foreground=INK, font=f['action'])
-        self.style.configure('SideNote.TLabel', background=SIDEBAR, foreground=MUTED, font=f['small'])
-        self.style.configure('Paper.TLabel', background=PAPER, foreground=INK, font=f['action'])
-        self.style.configure('Section.TLabel', background=PAPER, foreground=INK, font=f['heading'])
-        self.style.configure('Metric.TLabel', background=PAPER, foreground=MAST, font=f['number'])
-        self.style.configure('Muted.TLabel', background=PAPER, foreground=MUTED, font=f['small'])
-        self.style.configure('Status.TLabel', background=SIDEBAR, foreground=MUTED, font=f['small'])
-        self.style.configure('TButton', font=f['action'], padding=(self.px(11), self.px(6)), borderwidth=1, relief='flat',
-                             background=PAPER, foreground=INK, bordercolor=LINE, lightcolor=PAPER, darkcolor=PAPER,
-                             focusthickness=2, focuscolor=ACCENT)
-        self.style.map('TButton', background=[('pressed', '#d1e1e8'), ('active', '#e0ebf0')],
-                       bordercolor=[('focus', ACCENT)], foreground=[('disabled', '#556a74')])
-        self.style.configure('Primary.TButton', foreground=PAPER, background=ACCENT, bordercolor=ACCENT,
-                             lightcolor=ACCENT, darkcolor=ACCENT, padding=(self.px(12), self.px(8)), focuscolor=PAPER)
-        self.style.map('Primary.TButton', background=[('disabled', '#dce6eb'), ('pressed', '#214555'), ('active', MAST)],
-                       bordercolor=[('disabled', LINE), ('focus', ACCENT)], foreground=[('disabled', MUTED)])
-        self.style.configure('TEntry', padding=(self.px(8), self.px(5)), bordercolor=LINE, fieldbackground=PAPER,
-                             foreground=INK, insertcolor=INK, lightcolor=PAPER, darkcolor=PAPER)
-        self.style.map('TEntry', bordercolor=[('focus', ACCENT)], lightcolor=[('focus', ACCENT)])
-        self.style.configure('TCombobox', padding=(self.px(8), self.px(4)), bordercolor=LINE, fieldbackground=PAPER,
-                             foreground=INK, arrowcolor=MAST)
-        self.style.map('TCombobox', fieldbackground=[('readonly', PAPER)], bordercolor=[('focus', ACCENT)],
-                       lightcolor=[('focus', ACCENT)])
-        self.style.configure('Treeview', font=f['body'], background=PAPER, fieldbackground=PAPER,
-                             foreground=INK, borderwidth=0)
-        self.style.configure('Treeview.Heading', font=f['action'], background='#d7e5ec',
-                             foreground=MAST, padding=(self.px(7), self.px(8)), relief='flat', borderwidth=1,
-                             bordercolor=LINE, lightcolor='#d7e5ec', darkcolor='#d7e5ec')
-        self.style.map('Treeview.Heading', background=[('active', '#d7e5ec')])
-        self.style.map('Treeview', background=[('selected', '#b9d9e4')], foreground=[('selected', INK)])
-        self.style.configure('TScrollbar', arrowsize=self.px(13), background='#cfdee5', troughcolor=SIDEBAR,
-                             bordercolor=LINE, arrowcolor=MUTED)
+    def save_preferences(self, **changes):
+        try:
+            save_settings(changes)
+        except OSError:
+            self.status.set('Не удалось сохранить настройки.')
+
+    def make_icon(self, kind):
+        size = self.px(18 * self.factor)
+        icon = tk.PhotoImage(master=self.root, width=size, height=size)
+        color = THEMES[self.theme]['fg']
+        for y in range(size):
+            for x in range(size):
+                dx, dy = (x + .5) * 18 / size - 9, (y + .5) * 18 / size - 9
+                distance = hypot(dx, dy)
+                if kind == 'menu':
+                    filled = abs(dx) < 7 and any(abs(dy - line) < .8 for line in (-4, 0, 4))
+                elif kind == 'sun':
+                    filled = 3.4 < distance < 4.8 or (5.9 < distance < 8.4 and
+                        (min(abs(dx), abs(dy)) < .85 or abs(abs(dx) - abs(dy)) < 1.05))
+                else:
+                    filled = hypot(dx + 1, dy - .7) < 7.2 and hypot(dx - 2.7, dy + 2.8) > 6.4
+                if filled:
+                    icon.put(color, (x, y))
+        return icon
+
+    def configure_buttons(self, colors):
+        radius = max(2, self.px(7 * self.factor))
+        key = self.theme, radius
+        if key not in self.theme_images:
+            images = {}
+            for variant, fill, border in (
+                ('quiet', colors['bg'], colors['bg']), ('field', colors['panel'], colors['line']),
+                ('action', colors['accent'], colors['accent']),
+            ):
+                prefix = f'Surf.{self.theme}.{radius}.{variant}'
+                states = [rounded_tile(self.root, radius, fill, border),
+                          rounded_tile(self.root, radius, colors['selected'], colors['accent']),
+                          rounded_tile(self.root, radius, colors['selected'] if variant == 'action' else fill, colors['accent']),
+                          rounded_tile(self.root, radius, colors['panel'], colors['line'])]
+                self.style.element_create(prefix, 'image', states[0], ('active', states[1]), ('focus', states[2]),
+                                          ('disabled', states[3]), border=radius + 1, padding=1, sticky='nsew')
+                images[variant] = (prefix, states)
+            self.theme_images[key] = images
+        height = self.px(34 * self.factor)
+        vertical = max(2, (height - self.fonts['button'].metrics('linespace') - 2) // 2)
+        for style, variant in (('TButton', 'field'), ('Quiet.TButton', 'quiet'), ('LatinQuiet.TButton', 'quiet'), ('Action.TButton', 'action'),
+                               ('Icon.TButton', 'quiet'), ('File.TButton', 'field')):
+            element = self.theme_images[key][variant][0]
+            self.style.layout(style, [(element, {'sticky': 'nsew', 'children': [
+                ('Button.padding', {'sticky': 'nsew', 'children': [('Button.label', {'sticky': 'nsew'})]})
+            ]})])
+            padding = (self.px(10), vertical)
+            if style == 'Icon.TButton':
+                padding = (self.px(7 * self.factor), self.px(7 * self.factor))
+            role = 'latin' if style == 'LatinQuiet.TButton' else 'button'
+            self.style.configure(style, background=colors['bg'], font=self.fonts[role], padding=padding,
+                                 foreground=colors['on_accent'] if variant == 'action' else colors['fg'],
+                                 anchor='center')
+            self.style.map(style, foreground=[('disabled', colors['muted']), ('active', colors['fg']), ('focus', colors['fg'])])
+
+    def apply_theme(self):
+        c = THEMES[self.theme]
+        self.root.configure(bg=c['bg'])
+        self.style.configure('.', background=c['bg'], foreground=c['fg'], font=self.fonts['body'])
+        self.style.configure('TFrame', background=c['bg'])
+        self.style.configure('Rule.TFrame', background=c['line'])
+        for style, role, color in (('Title', 'title', 'fg'), ('Section', 'section', 'fg'), ('Small', 'small', 'muted'),
+                                   ('Body', 'body', 'fg')):
+            self.style.configure(f'{style}.TLabel', background=c['bg'], foreground=c[color], font=self.fonts[role])
+        self.style.configure('SearchHint.TLabel', background=c['panel'], foreground=c['muted'], font=self.fonts['body'])
+        self.configure_buttons(c)
+        for style in ('TEntry', 'TCombobox'):
+            self.style.configure(style, padding=(self.px(9), self.px(6)), bordercolor=c['line'],
+                                 fieldbackground=c['panel'], foreground=c['fg'], insertcolor=c['fg'],
+                                 arrowcolor=c['fg'], background=c['panel'], lightcolor=c['panel'], darkcolor=c['panel'],
+                                 selectbackground=c['selected'], selectforeground=c['fg'])
+            self.style.map(style, fieldbackground=[('readonly', c['panel'])], foreground=[('readonly', c['fg'])],
+                           bordercolor=[('focus', c['accent'])], lightcolor=[('focus', c['accent'])])
+        self.style.configure('Treeview', background=c['bg'], foreground=c['fg'], fieldbackground=c['bg'],
+                             font=self.fonts['body'], rowheight=self.px(34 * self.factor), borderwidth=0)
+        self.style.configure('Treeview.Heading', background=c['bg'], foreground=c['muted'],
+                             padding=(self.px(7), self.px(7)), font=self.fonts['button'], relief='flat',
+                             lightcolor=c['bg'], darkcolor=c['bg'], bordercolor=c['line'])
+        self.style.map('Treeview.Heading', background=[('active', c['bg'])])
+        self.style.map('Treeview', background=[('selected', c['selected'])], foreground=[('selected', c['fg'])])
+        self.style.configure('TScrollbar', background=c['line'], troughcolor=c['bg'], arrowcolor=c['muted'],
+                             bordercolor=c['bg'], arrowsize=self.px(12))
+        self.root.option_add('*TCombobox*Listbox.background', c['panel'])
+        self.root.option_add('*TCombobox*Listbox.foreground', c['fg'])
+        self.root.option_add('*TCombobox*Listbox.selectBackground', c['selected'])
+        self.root.option_add('*TCombobox*Listbox.selectForeground', c['fg'])
+        for combo in (self.zoom_control, self.filter_control):
+            try:
+                popdown = combo.tk.call('ttk::combobox::PopdownWindow', str(combo))
+                combo.tk.call(f'{popdown}.f.l', 'configure', '-background', c['panel'], '-foreground', c['fg'],
+                              '-selectbackground', c['selected'], '-selectforeground', c['fg'],
+                              '-font', str(self.fonts['body']))
+            except tk.TclError:
+                pass
+        self.file_canvas.configure(bg=c['bg'])
+        self.detail.configure(bg=c['bg'], fg=c['fg'], selectbackground=c['selected'], selectforeground=c['fg'])
+        self.detail.tag_configure('accent', foreground=c['accent'], font=self.fonts['strong'])
+        self.detail.tag_configure('strong', font=self.fonts['strong'])
+        self.detail.tag_configure('small', foreground=c['muted'], font=self.fonts['small'])
+        self.detail.tag_configure('latin', font=self.fonts['latin_data'])
+        self.theme_button.configure(text=self.theme_action(), takefocus=True)
+        self.menu_icon = self.make_icon('menu')
+        self.theme_icon = self.make_icon('sun' if self.theme == 'dark' else 'moon')
+        self.menu_button.configure(image=self.menu_icon, compound='image')
+        self.theme_button.configure(image=self.theme_icon, compound='image')
+        for dialog in (self.key_window, self.tooltip_window):
+            if dialog is not None and dialog.winfo_exists():
+                dialog.configure(bg=c['bg'])
+
+    def theme_action(self):
+        return 'Включить светлую тему' if self.theme == 'dark' else 'Включить тёмную тему'
+
+    def toggle_theme(self):
+        self.theme = 'dark' if self.theme == 'light' else 'light'
+        self.hide_tooltip()
+        self.apply_theme()
+        self.save_preferences(theme=self.theme)
+
+    def apply_zoom(self, remember=True):
+        choice = self.zoom.get()
+        self.factor = zoom_factor(choice, self.screen[0], self.dpi)
+        for name, text_font in self.fonts.items():
+            text_font.configure(size=-self.px(self.sizes[name] * self.factor))
+        for column, _, width in COLUMNS:
+            size = self.px(width * self.factor)
+            self.table.column(column, width=size, minwidth=size, stretch=column == 'name',
+                              anchor='e' if column in NUMERIC else 'w')
+        self.apply_theme()
+        if remember:
+            self.save_preferences(zoom=choice)
 
     def build_header(self):
-        top = ttk.Frame(self.root, style='Mast.TFrame', padding=(self.px(20), self.px(12)))
-        top.grid(row=0, column=0, sticky='ew')
-        top.columnconfigure(1, weight=1)
-        ttk.Frame(top, width=self.px(5), style='ShelfMark.TFrame').grid(
-            row=0, column=0, rowspan=2, sticky='ns', padx=(0, self.px(12)), pady=self.px(3))
-        ttk.Label(top, text='Склад Массивбург', style='Brand.TLabel').grid(row=0, column=1, sticky='w')
-        ttk.Label(top, text='Проверка заявки', style='Mast.TLabel').grid(row=1, column=1, sticky='w')
-        ttk.Label(top, text='Масштаб', style='Brand.TLabel').grid(row=0, column=2, rowspan=2, padx=(0, self.px(9)))
-        ttk.Combobox(top, textvariable=self.zoom, values=ZOOMS, state='readonly', width=8,
-                     font=self.fonts['body']).grid(row=0, column=3, rowspan=2, sticky='e')
-        self.zoom.trace_add('write', lambda *_: self.set_zoom())
+        header = ttk.Frame(self.root, padding=(self.px(24), self.px(12), self.px(24), self.px(8)))
+        header.grid(row=0, column=0, sticky='ew')
+        header.columnconfigure(1, weight=1)
+        self.menu_button = ttk.Button(header, text='Меню', style='Icon.TButton', command=self.show_menu)
+        self.menu_button.grid(row=0, column=0, padx=(0, self.px(10)))
+        ttk.Label(header, text='Проверка заявок', style='Title.TLabel').grid(row=0, column=1, sticky='w')
+        ttk.Button(header, text='DeepSeek', command=self.open_key, style='LatinQuiet.TButton').grid(
+            row=0, column=2, padx=(self.px(7), self.px(12)))
+        ttk.Label(header, text='Масштаб', style='Small.TLabel').grid(row=0, column=3)
+        self.zoom_control = ttk.Combobox(header, textvariable=self.zoom, values=ZOOMS, state='readonly', width=8,
+                                         font=self.fonts['button'])
+        self.zoom_control.grid(row=0, column=4, padx=(self.px(7), self.px(12)))
+        ttk.Button(header, text='Открыть журналы', command=self.open_logs, style='Quiet.TButton').grid(row=0, column=5)
+        self.theme_button = ttk.Button(header, command=self.toggle_theme, style='Icon.TButton')
+        self.theme_button.grid(row=0, column=6, padx=(self.px(8), 0))
+        self.tooltip(self.theme_button, self.theme_action)
+        self.tooltip(self.menu_button, lambda: 'Меню')
 
-    def build_sidebar(self, parent):
-        panel = ttk.Frame(parent, style='Sidebar.TFrame', padding=self.px(16))
-        panel.grid(row=0, column=0, sticky='ns', padx=(0, self.px(15)))
+    def tooltip(self, widget, text):
+        widget.bind('<Enter>', lambda _: self.queue_tooltip(widget, text), add='+')
+        widget.bind('<Leave>', lambda _: self.hide_tooltip(), add='+')
+        widget.bind('<Destroy>', lambda _: self.hide_tooltip(), add='+')
+
+    def queue_tooltip(self, widget, text):
+        self.hide_tooltip()
+        self.tooltip_timer = self.root.after(550, lambda: self.show_tooltip(widget, text()))
+
+    def show_tooltip(self, widget, text):
+        self.tooltip_timer = None
+        if not widget.winfo_exists():
+            return
+        self.tooltip_window = window = tk.Toplevel(self.root)
+        window.overrideredirect(True)
+        ttk.Label(window, text=text, style='Small.TLabel', padding=self.px(6)).pack()
+        window.update_idletasks()
+        x = min(widget.winfo_rootx(), self.screen[0] - window.winfo_reqwidth())
+        window.geometry(f'+{max(0, x)}+{widget.winfo_rooty() + widget.winfo_height()}')
+
+    def hide_tooltip(self):
+        if self.tooltip_timer is not None:
+            self.root.after_cancel(self.tooltip_timer)
+            self.tooltip_timer = None
+        if self.tooltip_window is not None:
+            self.tooltip_window.destroy()
+            self.tooltip_window = None
+
+    def popup(self, button, items, event=None):
+        self.hide_tooltip()
+        c = THEMES[self.theme]
+        menu = tk.Menu(self.root, tearoff=False, background=c['panel'], foreground=c['fg'], font=self.fonts['body'],
+                       activebackground=c['selected'], activeforeground=c['fg'])
+        for name, action in items:
+            menu.add_command(label=name, command=action)
+        x = event.x_root if event else button.winfo_rootx()
+        y = event.y_root if event else button.winfo_rooty() + button.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+        menu.bind('<Unmap>', lambda _: self.root.after_idle(menu.destroy), add='+')
+
+    def show_menu(self):
+        self.popup(self.menu_button, [('Добавить заявки…', self.add_requests),
+                                    ('Заменить «Закупки»…', lambda: self.choose_source('purchases')),
+                                    ('Заменить реестр…', lambda: self.choose_source('registry')),
+                                    ('Проверить заявки', self.manual_run)])
+
+    def build_files(self):
+        files = ttk.Frame(self.root, padding=(self.px(24), 0, self.px(24), self.px(10)))
+        files.grid(row=1, column=0, sticky='ew')
+        files.columnconfigure(0, weight=1)
+        self.file_canvas = tk.Canvas(files, highlightthickness=0, borderwidth=0)
+        self.file_canvas.grid(row=0, column=0, rowspan=2, sticky='ew')
+        self.file_strip = ttk.Frame(self.file_canvas)
+        self.file_canvas.create_window(0, 0, window=self.file_strip, anchor='nw')
+        self.file_strip.bind('<Configure>', lambda _: self.resize_file_strip())
+        self.file_canvas.bind('<Configure>', lambda _: self.resize_file_strip())
+        self.file_scroll = ttk.Scrollbar(files, orient='horizontal', command=self.file_canvas.xview)
+        self.file_scroll.grid(row=2, column=0, sticky='ew')
+        self.file_canvas.configure(xscrollcommand=self.file_scroll.set)
+        self.add_button = ttk.Button(files, text='+', style='Icon.TButton', command=self.add_requests)
+        self.add_button.grid(row=0, column=1, padx=(self.px(6), self.px(12)))
+        self.tooltip(self.add_button, lambda: 'Добавить заявки Excel')
+        self.source_buttons = {}
+        for col, role in enumerate(('purchases', 'registry'), 2):
+            button = ttk.Button(files, width=20, style='File.TButton', command=lambda r=role: self.choose_source(r))
+            button.grid(row=0, column=col, padx=(self.px(8), 0))
+            button.bind('<Button-3>', lambda event, r=role: self.source_menu(r, event))
+            self.tooltip(button, lambda r=role: str(self.sources[r] or self.role_label(r)))
+            self.source_buttons[role] = button
+
+    def resize_file_strip(self):
+        width = self.file_strip.winfo_reqwidth()
+        self.file_canvas.configure(height=max(self.px(34), self.file_strip.winfo_reqheight()), scrollregion=(0, 0, width, 1))
+        if width > self.file_canvas.winfo_width():
+            self.file_scroll.grid()
+        else:
+            self.file_scroll.grid_remove()
+
+    @staticmethod
+    def role_label(role):
+        return 'Закупки' if role == 'purchases' else 'Реестр'
+
+    def refresh_files(self):
+        for child in self.file_strip.winfo_children():
+            child.destroy()
+        if not self.requests:
+            ttk.Button(self.file_strip, text='Добавить заявки Excel', style='File.TButton',
+                       command=self.add_requests).pack(side='left')
+        for path in self.requests:
+            text = path.name if len(path.name) <= 38 else f'{path.name[:32]}…{path.suffix}'
+            button = ttk.Button(self.file_strip, text=text, style='File.TButton')
+            button.configure(command=lambda p=path, b=button: self.request_menu(b, p))
+            button.bind('<Button-3>', lambda event, p=path, b=button: self.request_menu(b, p, event))
+            button.pack(side='left', padx=(0, self.px(8)))
+            self.tooltip(button, lambda p=path: str(p))
+        for role, button in self.source_buttons.items():
+            path = self.sources[role]
+            text = path.name if path else self.role_label(role)
+            button.configure(text=text if len(text) <= 23 else f'{text[:17]}…{path.suffix}')
+        self.root.after_idle(self.resize_file_strip)
+
+    def add_requests(self):
+        names = filedialog.askopenfilenames(parent=self.root, title='Выберите заявки Excel', filetypes=EXCEL)
+        if names:
+            existing = set(self.requests)
+            self.requests.extend(path for path in dict.fromkeys(Path(name).resolve() for name in names) if path not in existing)
+            self.refresh_files()
+            self.inputs_changed()
+
+    def request_menu(self, button, path, event=None):
+        self.popup(button, [('Удалить заявку', lambda: self.remove_request(path))], event)
+
+    def remove_request(self, path):
+        if path in self.requests:
+            self.requests.remove(path)
+            self.refresh_files()
+            self.inputs_changed()
+
+    def choose_source(self, role):
+        file = filedialog.askopenfilename(parent=self.root, title=self.role_label(role),
+                                           filetypes=EXCEL if role == 'purchases' else REGISTER)
+        if file:
+            self.set_source(role, Path(file).resolve())
+
+    def source_menu(self, role, event):
+        items = [('Заменить файл…', lambda: self.choose_source(role))]
+        if self.sources[role]:
+            items.append(('Убрать файл', lambda: self.set_source(role, None)))
+        self.popup(self.source_buttons[role], items, event)
+
+    def set_source(self, role, path):
+        self.sources[role] = path
+        self.save_preferences(**{role: str(path) if path else ''})
+        self.refresh_files()
+        self.inputs_changed()
+
+    def build_workspace(self):
+        outer = ttk.Frame(self.root)
+        outer.grid(row=2, column=0, sticky='nsew')
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+        ttk.Frame(outer, height=self.px(1), style='Rule.TFrame').grid(row=0, column=0, sticky='ew')
+        body = ttk.Frame(outer, padding=(self.px(24), self.px(16), self.px(24), self.px(12)))
+        body.grid(row=1, column=0, sticky='nsew')
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=3, uniform='workspace')
+        body.columnconfigure(2, weight=1, uniform='workspace')
+
+        panel = ttk.Frame(body, padding=(0, 0, self.px(16), 0))
+        panel.grid(row=0, column=0, sticky='nsew')
         panel.columnconfigure(0, weight=1)
-        ttk.Label(panel, text='Файлы проверки', style='SideHeading.TLabel').grid(
-            row=0, columnspan=2, sticky='w', pady=(0, self.px(15)))
-        for row, (role, label, types) in enumerate((
-            ('Заявка', 'Заявка конструктора', EXCEL),
-            ('Закупки', 'Закупки', EXCEL),
-            ('Реестр', 'Реестр сверки склада', REGISTER),
-        )):
-            self.path_input(panel, 1 + 2 * row, role, label, types)
-        ttk.Frame(panel, height=self.px(1), style='Rule.TFrame').grid(row=7, columnspan=2, sticky='ew', pady=self.px(13))
-        ttk.Label(panel, text='DeepSeek', style='SideHeading.TLabel').grid(row=8, columnspan=2, sticky='w')
-        self.key_entry = ttk.Entry(panel, textvariable=self.key, show='•', font=self.fonts['body'], width=25)
-        self.key_entry.grid(row=9, columnspan=2, sticky='ew', pady=(self.px(8), self.px(5)))
-        self.key_entry.bind('<Control-v>', self.paste_key)
-        self.key_entry.bind('<Control-V>', self.paste_key)
-        self.key_entry.bind('<Control-a>', self.select_key)
-        menu = tk.Menu(self.key_entry, tearoff=False)
-        menu.add_command(label='Вставить', command=self.paste_key)
-        menu.add_command(label='Выделить всё', command=self.select_key)
-        self.key_entry.bind('<Button-3>', lambda event: menu.tk_popup(event.x_root, event.y_root))
-        ttk.Button(panel, text='Вставить', command=self.paste_key).grid(row=10, column=0, sticky='ew',
-                                                                       padx=(0, self.px(5)))
-        ttk.Button(panel, text='Запомнить ключ', command=self.remember_key).grid(row=10, column=1, sticky='ew')
-        self.key_feedback = ttk.Label(panel, textvariable=self.key_note, style='SideNote.TLabel')
-        self.key_feedback.grid(row=11, columnspan=2, sticky='w', pady=(self.px(6), self.px(14)))
-        self.run_button = ttk.Button(panel, text='Проверить заявку', style='Primary.TButton', command=self.run)
-        self.run_button.grid(row=12, columnspan=2, sticky='ew')
-        ttk.Button(panel, text='Открыть журналы', command=self.open_logs).grid(row=13, columnspan=2, sticky='ew',
-                                                                               pady=(self.px(8), 0))
-
-    def path_input(self, panel, row, role, label, filetypes):
-        ttk.Label(panel, text=label, style='SideField.TLabel').grid(row=row, column=0, columnspan=2, sticky='w')
-        variable = self.path_values[role]
-        entry = ttk.Entry(panel, textvariable=variable, font=self.fonts['body'], width=23)
-        entry.grid(row=row + 1, column=0, sticky='ew', pady=(self.px(4), self.px(12)), padx=(0, self.px(5)))
-
-        def choose():
-            path = filedialog.askopenfilename(parent=self.root, title=label, filetypes=filetypes)
-            if path:
-                variable.set(path)
-
-        def reveal(*_):
-            entry.xview_moveto(1)
-
-        variable.trace_add('write', reveal)
-        entry.after_idle(reveal)
-        ttk.Button(panel, text='Обзор…', command=choose).grid(row=row + 1, column=1, sticky='ew',
-                                                               pady=(self.px(4), self.px(12)))
-
-    def build_workspace(self, parent):
-        panel = ttk.Frame(parent, style='Paper.TFrame', padding=self.px(16))
-        panel.grid(row=0, column=1, sticky='nsew')
-        panel.columnconfigure(0, weight=1)
-        panel.rowconfigure(3, weight=4)
-        panel.rowconfigure(4, weight=1)
-
-        header = ttk.Frame(panel, style='Paper.TFrame')
-        header.grid(row=0, column=0, sticky='ew', pady=(0, self.px(10)))
+        panel.rowconfigure(3, weight=1)
+        header = ttk.Frame(panel)
+        header.grid(row=0, column=0, sticky='ew')
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text='Результат', style='Section.TLabel').grid(row=0, column=0, sticky='w')
-        self.export_full = ttk.Button(header, text='Полный отчёт', state='disabled', command=self.export)
-        self.export_full.grid(row=0, column=1, padx=(0, self.px(6)))
-        self.export_inventory = ttk.Button(header, text='Выгрузить наличие', state='disabled',
-                                           style='Primary.TButton', command=lambda: self.export(inventory_only=True))
+        ttk.Label(header, text='Общий результат', style='Section.TLabel').grid(row=0, column=0, sticky='nw')
+        self.export_full = ttk.Button(header, text='Полный отчёт', command=self.export, state='disabled',
+                                      style='Quiet.TButton')
+        self.export_full.grid(row=0, column=1, padx=(self.px(8), self.px(8)))
+        self.export_inventory = ttk.Button(header, text='Выгрузить наличие', state='disabled', style='Action.TButton',
+                                           command=lambda: self.export(inventory_only=True))
         self.export_inventory.grid(row=0, column=2)
-
-        metrics = ttk.Frame(panel, style='Paper.TFrame', padding=(0, self.px(5), 0, self.px(9)))
-        metrics.grid(row=1, column=0, sticky='ew', pady=(0, self.px(8)))
-        for col, title in enumerate(('Позиций в заявке', 'Найдено на складе', 'Есть с количеством')):
-            column = col * 2
-            metrics.columnconfigure(column, weight=1, uniform='metrics')
-            inset = self.px(14) if col else 0
-            if col:
-                ttk.Frame(metrics, width=self.px(1), style='Rule.TFrame').grid(
-                    row=0, column=column - 1, rowspan=2, sticky='ns', pady=self.px(3))
-            ttk.Label(metrics, text=title, style='Muted.TLabel').grid(row=0, column=column, sticky='w', padx=(inset, 0))
-            ttk.Label(metrics, textvariable=self.stats[col], style='Metric.TLabel').grid(
-                row=1, column=column, sticky='w', padx=(inset, 0))
-        tools = ttk.Frame(panel, style='Paper.TFrame')
-        tools.grid(row=2, column=0, sticky='ew', pady=(0, self.px(7)))
-        tools.columnconfigure(2, weight=1)
-        ttk.Combobox(tools, textvariable=self.filter, values=FILTERS, state='readonly', width=21,
-                     font=self.fonts['body']).grid(row=0, column=0, sticky='w')
-        ttk.Label(tools, text='Поиск', style='Muted.TLabel').grid(row=0, column=1, padx=self.px(9))
-        ttk.Entry(tools, textvariable=self.query, font=self.fonts['body']).grid(row=0, column=2, sticky='ew')
-        self.filter.trace_add('write', lambda *_: self.fill_table())
-        self.query.trace_add('write', lambda *_: self.fill_table())
+        ttk.Label(panel, textvariable=self.summary, style='Small.TLabel').grid(
+            row=1, column=0, sticky='w', pady=(self.px(3), self.px(15)))
+        toolbar = ttk.Frame(panel)
+        toolbar.grid(row=2, column=0, sticky='ew', pady=(0, self.px(11)))
+        toolbar.columnconfigure(1, weight=1)
+        self.filter_control = ttk.Combobox(toolbar, textvariable=self.filter, values=FILTERS, state='readonly',
+                                           width=22, font=self.fonts['button'])
+        self.filter_control.grid(row=0, column=0)
+        self.search = ttk.Entry(toolbar, textvariable=self.query, font=self.fonts['body'])
+        self.search.grid(row=0, column=1, sticky='ew', padx=(self.px(10), 0))
+        self.search_hint = ttk.Label(self.search, text='Поиск по полке, названию или артикулу', style='SearchHint.TLabel')
+        self.search_hint.bind('<Button-1>', lambda _: self.search.focus_set())
+        self.search.bind('<FocusIn>', self.update_search_hint)
+        self.search.bind('<FocusOut>', self.update_search_hint)
+        self.query.trace_add('write', self.update_search_hint)
+        self.update_search_hint()
         self.build_table(panel)
 
-        details = ttk.Frame(panel, style='Paper.TFrame', padding=(0, self.px(13), 0, 0))
-        details.grid(row=4, column=0, sticky='nsew')
+        ttk.Frame(body, width=self.px(1), style='Rule.TFrame').grid(row=0, column=1, sticky='ns')
+        details = ttk.Frame(body, padding=(self.px(16), 0, 0, 0))
+        details.grid(row=0, column=2, sticky='nsew')
         details.columnconfigure(0, weight=1)
-        details.rowconfigure(1, weight=1)
-        ttk.Label(details, text='Данные по позиции', style='Paper.TLabel').grid(row=0, column=0, sticky='w',
-                                                                               pady=(0, self.px(4)))
-        self.detail = tk.Text(details, height=4, wrap='word', font=self.fonts['body'], state='disabled',
-                              foreground=INK, background=SIDEBAR, borderwidth=0, spacing1=self.px(2),
-                              padx=self.px(12), pady=self.px(8), highlightthickness=self.px(1),
-                              highlightbackground=LINE, highlightcolor=ACCENT)
-        self.detail.grid(row=1, column=0, sticky='nsew')
-        scroll = ttk.Scrollbar(details, command=self.detail.yview)
-        scroll.grid(row=1, column=1, sticky='ns')
+        details.rowconfigure(2, weight=1)
+        title = ttk.Label(details, text='Данные по позиции', style='Section.TLabel')
+        title.grid(row=0, column=0, columnspan=2, sticky='nw')
+        header.bind('<Configure>', lambda _: details.rowconfigure(0, minsize=header.winfo_height()))
+        title.bind('<Configure>', lambda _: title.configure(wraplength=details.winfo_width()))
+        ttk.Frame(details, height=self.px(1), style='Rule.TFrame').grid(
+            row=1, column=0, columnspan=2, sticky='ew', pady=(self.px(9), self.px(8)))
+        self.detail = tk.Text(details, width=1, height=1, wrap='word', font=self.fonts['body'], state='disabled',
+                              borderwidth=0, highlightthickness=0, spacing1=self.px(2), spacing3=self.px(2))
+        self.detail.grid(row=2, column=0, sticky='nsew')
+        self.detail.bind('<Configure>', lambda event: self.detail.configure(tabs=(max(self.px(100), event.width - self.px(8)), 'right')))
+        scroll = ttk.Scrollbar(details, orient='vertical', command=self.detail.yview)
+        scroll.grid(row=2, column=1, sticky='ns')
         self.detail.configure(yscrollcommand=scroll.set)
-        ttk.Label(panel, textvariable=self.sources, style='Muted.TLabel', padding=(0, self.px(7), 0, 0)).grid(
-            row=5, column=0, sticky='ew')
+
+    def update_search_hint(self, *_):
+        if self.query.get() or self.root.focus_get() is self.search:
+            self.search_hint.place_forget()
+        else:
+            self.search_hint.place(x=self.px(9), rely=.5, anchor='w', relwidth=.9)
 
     def build_table(self, parent):
-        panel = ttk.Frame(parent, style='Paper.TFrame')
+        panel = ttk.Frame(parent)
         panel.grid(row=3, column=0, sticky='nsew')
         panel.columnconfigure(0, weight=1)
         panel.rowconfigure(0, weight=1)
-        self.table = ttk.Treeview(panel, columns=[col for col, _, _ in COLUMNS], show='headings', selectmode='browse')
+        self.table = ttk.Treeview(panel, columns=[col for col, _, _ in COLUMNS], show='headings',
+                                  selectmode='browse', takefocus=True)
         self.table.grid(row=0, column=0, sticky='nsew')
         for col, title, _ in COLUMNS:
-            self.table.heading(col, text=title, anchor='w')
-        vertical = ttk.Scrollbar(panel, command=self.table.yview)
-        vertical.grid(row=0, column=1, sticky='ns')
-        horizontal = ttk.Scrollbar(panel, orient='horizontal', command=self.table.xview)
-        horizontal.grid(row=1, column=0, sticky='ew')
-        self.table.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        self.table.tag_configure('confirmed', background='#dcece8')
-        self.table.tag_configure('found', background='#f7edd8')
-        self.table.tag_configure('stripe', background='#f0f5f7')
+            self.table.heading(col, text=title, anchor='e' if col in NUMERIC else 'w')
+        scroll_y = ttk.Scrollbar(panel, command=self.table.yview)
+        scroll_y.grid(row=0, column=1, sticky='ns')
+        scroll_x = ttk.Scrollbar(panel, orient='horizontal', command=self.table.xview)
+        scroll_x.grid(row=1, column=0, sticky='ew')
+        self.table.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
         self.table.bind('<<TreeviewSelect>>', self.show_details)
-        self.empty = ttk.Label(panel, text='Загрузите файлы и запустите проверку.', style='Muted.TLabel')
-        self.empty.place(relx=.5, rely=.5, anchor='center')
+        self.empty = ttk.Label(panel, text='Выберите файлы для проверки.', style='Small.TLabel')
+        self.empty.place(relx=.5, rely=.44, anchor='center')
 
-    def set_zoom(self):
-        choice = self.zoom.get()
-        factor = zoom_factor(choice, self.screen[0], self.dpi)
-        for key, (size, _) in TYPE_SCALE.items():
-            self.fonts[key].configure(size=round(size * factor))
-        self.style.configure('Treeview', rowheight=self.px(31 * factor))
-        for col, _, width in COLUMNS:
-            size = self.px(width * factor)
-            self.table.column(col, width=size, minwidth=size, stretch=col == 'name',
-                              anchor='e' if col in ('need', 'free', 'take', 'buy') else 'w')
-        self.key_feedback.configure(wraplength=self.px(240 * factor))
-        if self.started:
-            try:
-                save_settings({'zoom': choice})
-            except OSError:
-                pass
+    def open_key(self):
+        if self.key_window is not None and self.key_window.winfo_exists():
+            self.key_window.lift()
+            self.key_entry.focus_set()
+            return
+        self.key_window = dialog = tk.Toplevel(self.root)
+        dialog.title('Ключ DeepSeek')
+        dialog.transient(self.root)
+        dialog.configure(bg=THEMES[self.theme]['bg'])
+        frame = ttk.Frame(dialog, padding=self.px(20))
+        frame.pack(fill='both', expand=True)
+        frame.columnconfigure(0, weight=1)
+        self.key_entry = ttk.Entry(frame, textvariable=self.key, show='•', font=self.fonts['body'], width=38)
+        self.key_entry.grid(row=0, column=0, columnspan=3, sticky='ew', pady=(0, self.px(9)))
+        self.key_entry.bind('<Control-v>', self.paste_key)
+        self.key_entry.bind('<Control-V>', self.paste_key)
+        self.key_entry.bind('<Control-a>', self.select_key)
+        self.key_entry.bind('<Button-3>', lambda event: self.popup(self.key_entry, [
+            ('Вставить', self.paste_key), ('Выделить всё', self.select_key)], event))
+        ttk.Button(frame, text='Вставить', command=self.paste_key).grid(row=1, column=0, sticky='ew')
+        ttk.Button(frame, text='Запомнить ключ', command=self.remember_key).grid(row=1, column=1, padx=self.px(8))
+        ttk.Button(frame, text='Готово', command=self.close_key).grid(row=1, column=2)
+        ttk.Label(frame, textvariable=self.key_note, style='Small.TLabel').grid(
+            row=2, column=0, columnspan=3, sticky='w', pady=(self.px(8), 0))
+        self.initial_key = self.key.get().strip()
+        dialog.protocol('WM_DELETE_WINDOW', self.close_key)
+        dialog.bind('<Escape>', lambda _: self.close_key())
+        self.key_entry.focus_set()
+
+    def close_key(self):
+        changed = self.initial_key != self.key.get().strip()
+        self.key_window.destroy()
+        self.key_window = self.key_entry = None
+        if changed and not self.missing():
+            self.inputs_changed()
 
     def select_key(self, _event=None):
         self.key_entry.focus_set()
@@ -386,70 +644,102 @@ class App:
         except Exception:
             self.key_note.set('Сохранение недоступно. Ключ действует до закрытия окна.')
 
-    def run(self):
-        paths = tuple(Path(value.get().strip().strip('"')).expanduser() for value in self.path_values.values())
-        if any(not path.is_file() for path in paths):
-            self.status.set('Выберите заявку Excel, выгрузку «Закупки» и реестр JSON.')
-            return
-        if len({path.resolve() for path in paths}) != 3:
-            self.status.set('Укажите отдельный файл для каждого поля.')
-            return
-        try:
-            save_settings({'purchases': str(paths[1].resolve()), 'registry': str(paths[2].resolve())})
-        except OSError:
-            pass
-        self.status.set('Читаю файлы и сверяю остатки…')
-        self.sources.set('')
-        self.fill_details('')
-        self.table.delete(*self.table.get_children())
-        self.empty.place_forget()
-        self.run_button.configure(state='disabled')
-        self.export_full.configure(state='disabled')
-        self.export_inventory.configure(state='disabled')
+    def missing(self):
+        files = []
+        if not self.requests:
+            files.append('заявку Excel')
+        if not self.sources['purchases']:
+            files.append('«Закупки»')
+        if not self.sources['registry']:
+            files.append('реестр')
+        if files:
+            return f'Добавьте {", ".join(files)}.'
+        paths = [*self.requests, *self.sources.values()]
+        if len(set(paths)) != len(paths):
+            return 'Укажите отдельные файлы для заявок, «Закупок» и реестра.'
+        return ''
+
+    def manual_run(self, _event=None):
+        self.inputs_changed()
+        return 'break'
+
+    def inputs_changed(self):
+        self.revision += 1
+        if self.cancellation is not None:
+            self.cancellation.set()
+        if self.timer is not None:
+            self.root.after_cancel(self.timer)
+            self.timer = None
         self.report = None
-        self.input_files = paths
-        for stat in self.stats:
-            stat.set('—')
-        threading.Thread(target=self.worker, args=(paths, self.key.get().strip()), daemon=True).start()
+        self.input_files = ()
+        self.summary.set('—')
+        self.table.delete(*self.table.get_children())
+        self.clear_details()
+        self.export_full.state(['disabled'])
+        self.export_inventory.state(['disabled'])
+        missing = self.missing()
+        self.status.set(missing or f'Проверяю заявки: {len(self.requests)}…')
+        self.empty.configure(text=missing or 'Читаю файлы и сверяю остатки…')
+        self.empty.place(relx=.5, rely=.44, anchor='center')
+        if not missing:
+            self.timer = self.root.after(160, self.launch)
+
+    def launch(self):
+        self.timer = None
+        if self.running is not None or self.missing():
+            return
+        paths = tuple(self.requests), self.sources['purchases'], self.sources['registry']
+        self.running = self.revision
+        self.cancellation = threading.Event()
+        args = self.running, paths, self.key.get().strip(), self.cancellation.is_set
+        threading.Thread(target=self.worker, args=args, daemon=True).start()
         self.root.after(100, self.finish)
 
-    def worker(self, paths, key):
+    def worker(self, revision, paths, key, cancelled):
+        report, error = None, ''
         try:
-            report, _ = check_files(*paths, key, LOGS)
-            self.events.put((report, ''))
-        except Exception as error:
-            self.events.put((None, str(error) or type(error).__name__))
+            report, _ = check_files(*paths, key, LOGS, cancel=cancelled)
+        except CancelledError:
+            pass
+        except Exception as exc:
+            error = str(exc) or type(exc).__name__
+        self.events.put((revision, paths, report, error))
 
     def finish(self):
         try:
-            report, note = self.events.get_nowait()
+            revision, paths, report, error = self.events.get_nowait()
         except queue.Empty:
             self.root.after(100, self.finish)
             return
-        self.run_button.configure(state='normal')
+        self.running = self.cancellation = None
+        if revision != self.revision:
+            if self.timer is None and not self.missing():
+                self.launch()
+            return
+        if error:
+            self.status.set(error)
+            self.empty.configure(text='Замените файл, указанный в строке состояния.')
+            return
         if report is None:
-            self.status.set('Проверка прервана.')
-            self.empty.place(relx=.5, rely=.5, anchor='center')
-            messagebox.showerror('Ошибка проверки', note, parent=self.root)
             return
         self.report = report
+        self.input_files = (*paths[0], paths[1], paths[2])
         rows = report['rows']
         found = sum(row['stock_found'] for row in rows)
-        counted = sum(row['stock_found'] and ((row['stock_qty'] or 0) > 0 or (row['free_qty'] or 0) > 0) for row in rows)
-        for stat, value in zip(self.stats, (len(rows), found, counted)):
-            stat.set(str(value))
-        self.query.set('')
-        self.filter.set(FILTERS[1] if found else FILTERS[0])
-        self.status.set(report['ai'])
-        dates = [f'{role}   {(info.get("exported") or info["modified"])[:16].replace("T", " ")}'
-                 for role, info in report['files'].items()]
-        self.sources.set('     '.join(dates))
-        self.export_full.configure(state='normal')
-        self.export_inventory.configure(state='normal')
+        counted = sum((row['stock_qty'] or 0) > 0 or (row['free_qty'] or 0) > 0 for row in rows)
+        self.summary.set(f'Заявок: {report["request_count"]}    Позиций: {len(rows)}    Найдено: {found}    С количеством: {counted}')
+        if self.filter.get() == FILTERS[0] and found:
+            self.filter.set(FILTERS[1])
+        else:
+            self.fill_table()
+        self.status.set(f'Проверено заявок: {report["request_count"]}.  {report["ai"]}')
+        self.export_full.state(['!disabled'])
+        self.export_inventory.state(['!disabled'])
 
     def fill_table(self):
         if self.report is None:
             return
+        selected = self.table.selection()
         self.table.delete(*self.table.get_children())
         query = self.query.get().strip().casefold()
         code_query = article_key(query)
@@ -458,55 +748,86 @@ class App:
             if (view == FILTERS[1] and not row['stock_found']) or (view == FILTERS[2] and row['take'] is not None):
                 continue
             article = row['article'] or row['matched_article']
-            shelf = locations_text(row) or ', '.join(row['stock_places'])
-            row_articles = [article, *(code for item in row['registry'] for code in item['articles'])]
-            searchable = ' '.join([row['name'], shelf, *row_articles]).casefold()
-            if query and query not in searchable and not (code_query and any(code_query in article_key(code) for code in row_articles)):
+            assigned = dict.fromkeys(item['place'] for item in row['locations'])
+            shelf = ', '.join(assigned or row['stock_places'])
+            codes = [article, *(line['article'] for line in row.get('request_lines', [])),
+                     *(code for item in row['registry'] for code in item['articles'])]
+            names = [line['name'] for line in row.get('request_lines', [])]
+            searchable = ' '.join([row['name'], shelf, *codes, *names]).casefold()
+            if query and query not in searchable and not (code_query and any(code_query in article_key(code) for code in codes)):
                 continue
-            tag = 'confirmed' if (row['take'] or 0) > 0 else 'found' if row['stock_found'] else 'stripe' if row['row'] % 2 else ''
-            values = (row['row'], article, row['name'], unit_quantity(row['need'], row['unit']), inventory_text(row),
+            values = (article, row['name'], unit_quantity(row['need'], row['unit']), inventory_text(row),
                       unit_quantity(row['free_qty'], row['free_unit']), shelf,
                       show_number(row['take']), show_number(row['buy']), row['status'])
-            self.table.insert('', 'end', iid=str(row['row']), values=values, tags=(tag,))
+            self.table.insert('', 'end', iid=str(row['row']), values=values)
         items = self.table.get_children()
         if items:
             self.empty.place_forget()
-            self.table.selection_set(items[0])
-            self.table.focus(items[0])
-            self.table.see(items[0])
+            target = selected[0] if selected and selected[0] in items else items[0]
+            self.table.selection_set(target)
+            self.table.focus(target)
+            self.table.see(target)
+            self.show_details()
         else:
             self.empty.configure(text='По этому фильтру позиций нет.')
-            self.empty.place(relx=.5, rely=.5, anchor='center')
-            self.fill_details('')
+            self.empty.place(relx=.5, rely=.44, anchor='center')
+            self.clear_details()
 
-    def fill_details(self, text):
+    def clear_details(self):
         self.detail.configure(state='normal')
         self.detail.delete('1.0', 'end')
-        self.detail.insert('1.0', text)
         self.detail.configure(state='disabled')
 
-    def show_details(self, _event):
+    def show_details(self, _event=None):
         selection = self.table.selection()
         if not selection or not self.report:
             return
         row = next(row for row in self.report['rows'] if row['row'] == int(selection[0]))
-        lines = [row['name'], row['reason']]
+        self.detail.configure(state='normal')
+        self.detail.delete('1.0', 'end')
+
+        def line(text, tag=''):
+            self.detail.insert('end', f'{text}\n', tag)
+
+        line(row['name'] or row['article'], 'strong')
+        code = row['article'] or row['matched_article']
+        if code:
+            line(code, 'latin' if code.isascii() else 'small')
+        line('')
+        for item in row.get('request_lines', []):
+            line(f'{item["file"]}\t{unit_quantity(item["need"], item["unit"])}')
+            line(f'{item["sheet"]}, строка {item["row"]}', 'small')
+        line('')
+        if row['stock_places']:
+            self.detail.insert('end', 'Полка\t')
+            line(locations_text(row) if len(row['locations']) > 1 else
+                 ', '.join(item['place'] for item in row['locations']) or ', '.join(row['stock_places']), 'accent')
+        line(f'Взять\t{unit_quantity(row["take"], row["unit"])}', 'strong')
+        line(f'Докупить\t{unit_quantity(row["buy"], row["unit"])}', 'strong')
+        line(row['reason'], 'small')
         for key, title in (('purchases', 'Закупки'), ('registry', 'Реестр'),
                            ('suggestions', 'Подсказки DeepSeek'), ('candidates', 'Кандидаты')):
             if row.get(key):
-                lines.append(f'\n{title}')
+                line('')
+                line(title, 'strong')
                 for item in row[key]:
                     relation = {'same': 'Та же позиция: ', 'alternative': 'Аналог: '}.get(item.get('relation'), '')
-                    lines.append(relation + item_text(item))
-        self.fill_details('\n'.join(lines))
+                    line(relation + item_text(item))
+        line('')
+        for role in ('Закупки', 'Реестр'):
+            info = self.report['files'][role]
+            date = (info.get('exported') or info['modified'])[:16].replace('T', ' ')
+            line(f'{role}: {date}', 'small')
+        self.detail.configure(state='disabled')
+        self.detail.see('1.0')
 
     def export(self, inventory_only=False):
         if self.report is None:
             return
         label = 'Выгрузить наличие' if inventory_only else 'Сохранить полный отчёт'
         suffix = 'наличие' if inventory_only else 'проверка'
-        name = filedialog.asksaveasfilename(parent=self.root, title=label,
-                                           initialfile=f'{self.input_files[0].stem} — {suffix}.xlsx',
+        stem = self.input_files[0].stem if self.report['request_count'] == 1 else 'Склад Массивбург'
+        name = filedialog.asksaveasfilename(parent=self.root, title=label, initialfile=f'{stem} — {suffix}.xlsx',
                                            filetypes=[('Excel', '*.xlsx')], defaultextension='.xlsx')
         if not name:
             return
@@ -534,6 +855,7 @@ class App:
 
 if __name__ == '__main__':
     enable_windows_dpi()
+    load_windows_fonts()
     root = tk.Tk()
     App(root)
     root.mainloop()
